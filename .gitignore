@@ -1,0 +1,12 @@
+.local/
+.runtime/
+sync.local.json
+runtime.json
+focus-questions.json
+data.json
+cache/
+release/
+__pycache__/
+*.pyc
+.env
+.env.*
