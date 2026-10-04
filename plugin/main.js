@@ -40,12 +40,13 @@ function locate(text, quote, before = '', after = '') {
 function decorate(el, block) {
   const points = [...new Set([0, ...block.groups.flatMap(s => [s.start, s.end]), ...block.predicates.flatMap(s => [s.start, s.end])])].sort((a, b) => a - b);
   const segments = [];
+  const starts = block.groups.map(s => s.start + s.text.search(/\S/));
   let g = 0, p = 0;
   for (let i = 0; i < points.length - 1; i++) {
     const start = points[i], end = points[i + 1];
     while (g < block.groups.length && block.groups[g].end <= start) g++;
     while (p < block.predicates.length && block.predicates[p].end <= start) p++;
-    segments.push({ start, end, group: block.groups[g]?.start <= start ? g % 3 : -1, pred: block.predicates[p]?.start <= start ? block.predicates[p] : null });
+    segments.push({ start, end, group: block.groups[g]?.start <= start ? g % 2 : -1, boundary: g > 0 ? starts[g] : -1, pred: block.predicates[p]?.start <= start ? block.predicates[p] : null });
   }
   let offset = 0, cursor = 0;
   for (const node of textNodes(el)) {
@@ -62,6 +63,7 @@ function decorate(el, block) {
       mark.className = 'era-mark';
       mark.textContent = text;
       if (segment.group >= 0) mark.dataset.group = String(segment.group);
+      if (segment.boundary >= pos && segment.boundary < stop) mark.dataset.groupStart = 'true';
       const pred = segment.pred;
       if (pred) { mark.dataset.role = pred.role; mark.title = `${roles[pred.role]} · 动词链：${pred.chain}`; }
       fragment.append(mark); pos = stop;
@@ -167,8 +169,8 @@ class Reader extends ItemView {
     this.focusButton = this.button(bar, '专注阅读', () => { const focus = this.layout.classList.toggle('era-focus'); this.focusButton.setAttribute('aria-pressed', String(focus)); }, 'panel-right-close');
     this.focusButton.setAttribute('aria-pressed', 'false');
     const legend = this.contentEl.createDiv('era-legend');
-    const swatches = legend.createSpan('era-swatches'); for (let i = 0; i < 3; i++) swatches.createSpan({ attr: { 'data-group': String(i), 'aria-hidden': 'true' } });
-    legend.createSpan({ text: '意群底色' });
+    const swatches = legend.createSpan('era-swatches'); for (let i = 0; i < 2; i++) swatches.createSpan({ attr: { 'data-group': String(i), 'aria-hidden': 'true' } });
+    legend.createSpan({ text: '意群分段' });
     for (const [role, label] of Object.entries(roles)) legend.createSpan({ text: label, attr: { 'data-role': role } });
     this.statusEl = this.contentEl.createDiv({ cls: 'era-status', text: '选择「分析文章」开启阅读辅助。', attr: { role: 'status', 'aria-live': 'polite' } });
     this.layout = this.contentEl.createDiv('era-layout');

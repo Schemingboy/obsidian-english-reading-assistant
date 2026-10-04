@@ -1,10 +1,9 @@
-"""Run: python check-colors.py. Check text contrast and pairwise group separation.
+"""Run: python check-colors.py. Check neutral layers, text and boundary contrast.
 
-Delta E 76 >= 18 is this project's regression threshold, not a WCAG rule
-or a guarantee for every display or kind of color vision.
+Neutral-chroma and lightness thresholds are project regression checks,
+not WCAG rules or a numerical guarantee of aesthetic harmony.
 """
 from pathlib import Path
-from itertools import combinations
 import json
 import math
 import re
@@ -38,25 +37,29 @@ def lab(color):
     return [116 * y - 16, 500 * (x - y), 200 * (y - z)]
 
 
-def separation(groups):
-    return [math.dist(lab(a), lab(b)) for a, b in combinations(groups, 2)]
-
-
 def check():
     css = Path(__file__).with_name('styles.css').read_text(encoding='utf-8-sig')
     results = {}
     for theme, selector, body in [('light', '.era-view', '#1d1f20'), ('dark', '.theme-dark .era-view', '#d3dade')]:
         block = re.search(re.escape(selector) + r'\s*\{([^}]+)', css)[1]
         values = dict(re.findall(r'--era-([\w-]+):\s*(#[0-9a-f]{6});', block))
-        groups = [rgb(values[f'group-{i}']) for i in range(3)]
+        groups = [rgb(values[f'group-{i}']) for i in range(2)]
         inks = [rgb(body)] + [rgb(values[key]) for key in ['main', 'subordinate', 'nonfinite']]
         ratios = [contrast(ink, bg) for ink in inks for bg in groups]
-        distances = separation(groups)
+        boundaries = [contrast(rgb(values['boundary']), bg) for bg in groups]
+        chroma = [math.hypot(*lab(bg)[1:]) for bg in groups]
+        lightness = abs(lab(groups[0])[0] - lab(groups[1])[0])
         assert min(ratios) >= 4.5, (theme, 'text contrast', ratios)
-        assert min(distances) >= 18, (theme, 'group separation', distances)
-        results[theme] = {'groups': [values[f'group-{i}'] for i in range(3)],
+        assert min(boundaries) >= 3, (theme, 'boundary contrast', boundaries)
+        assert max(chroma) <= 10, (theme, 'background must remain neutral', chroma)
+        assert lightness >= 5, (theme, 'alternating lightness', lightness)
+        assert values['main'] == values['subordinate'], 'Finite verbs share one accent hue.'
+        assert 'data-group-start' in css and 'content: \'\'' in css, 'Group boundaries must have a non-color cue.'
+        results[theme] = {'groups': [values[f'group-{i}'] for i in range(2)],
                           'minimumTextContrast': round(min(ratios), 2),
-                          'pairwiseDeltaE76': [round(v, 2) for v in distances]}
+                          'minimumBoundaryContrast': round(min(boundaries), 2),
+                          'maximumBackgroundChroma': round(max(chroma), 2),
+                          'lightnessDifference': round(lightness, 2)}
     return results
 
 
