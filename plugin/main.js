@@ -1,16 +1,28 @@
-const { Plugin, ItemView, MarkdownRenderer, Component, Notice, TFile, setIcon } = require('obsidian');
+const { Plugin, ItemView, MarkdownRenderer, Component, Notice, TFile, Scope, Keymap, setIcon } = require('obsidian');
 const { spawn } = require('child_process');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
 const { setImmediate } = require('timers');
 const TYPE = 'english-reading-assistant';
-const VERSION = 'spacy-en-sm-3.8.0-r2';
+const VERSION = 'spacy-en-sm-3.8.0-r4';
 const hash = text => createHash('sha256').update(text).digest('hex');
 const today = () => new Date().toLocaleDateString('sv-SE');
 const roles = { main: '主句谓语', subordinate: '从句谓语', nonfinite: '非谓语动词' };
 const SKIP = 'code,pre,script,style,math,.math,.internal-embed,.frontmatter,.metadata-container,button,svg';
 // Browser timers are clamped while Obsidian is covered; Node's turn still yields to other work.
 const yieldUI = () => new Promise(resolve => setImmediate(resolve));
+const excerpts = draft => Array.isArray(draft.excerpts) ? draft.excerpts : draft.quote ? [{ quote: draft.quote, before: draft.before || '', after: draft.after || '' }] : [];
+function setExcerpts(draft, items) {
+  draft.excerpts = items;
+  Object.assign(draft, items[0] || { quote: '', before: '', after: '' });
+}
+function separateHeadings(content) {
+  // Display-only: preserve text nodes and offsets used for source mapping.
+  for (const p of content.querySelectorAll('p')) {
+    const first = [...p.childNodes].find(n => n.textContent.trim());
+    if (first?.nodeType === 1 && first.tagName === 'STRONG' && first.textContent.trim().length < 160 && /[.!?:]$/.test(first.textContent.trim()) && first.nextSibling?.textContent.trim()) first.classList.add('era-inline-heading');
+  }
+}
 
 function textNodes(el) {
   const out = [], walker = el.ownerDocument.createTreeWalker(el, 4);
@@ -56,17 +68,57 @@ function applyLinkPatch(raw, expectedHash, start, before, after) {
   if (hash(raw) !== expectedHash || raw.slice(start, start + before.length) !== before) throw Error('原文已变化，本次未写入。请刷新后重新选择。');
   return raw.slice(0, start) + after + raw.slice(start + before.length);
 }
+function quoteMarkdown(items, eol = '\n') {
+  return items.map(item => item.quote.split(/\r?\n/).map(line => `> ${line}`).join(eol)).join(eol + eol);
+}
+function notePrefix(label, link, question, quotes, eol = '\n') {
+  const quoted = quoteMarkdown(quotes, eol);
+  return `## ${label}${eol}${eol}来源：${link}${eol}${eol}${question ? `问题：${question}${eol}${eol}` : ''}${quoted ? quoted + eol + eol : ''}`;
+}
+function noteEntries(raw) {
+  const entries = []; let previousEnd = 0;
+  for (const match of raw.matchAll(/<!-- era:([A-Za-z0-9+/=]+) -->/g)) {
+    try {
+      const meta = JSON.parse(Buffer.from(match[1], 'base64').toString('utf8'));
+      if (!meta || (typeof meta.quote !== 'string' && !Array.isArray(meta.excerpts))) continue;
+      const section = raw.slice(previousEnd, match.index), heading = /^## ([^\r\n]+)\r?\n\r?\n来源：([^\r\n]+)\r?\n\r?\n/m.exec(section);
+      if (!heading) continue;
+      const start = previousEnd + heading.index, end = match.index + match[0].length;
+      const markdown = raw.slice(start, match.index), eol = heading[0].includes('\r\n') ? '\r\n' : '\n';
+      const prefix = notePrefix(heading[1], heading[2], meta.question || '', excerpts(meta), eol);
+      const editable = markdown.startsWith(prefix) && markdown.endsWith(eol + eol);
+      entries.push({ ...meta, meta, start, end, original: raw.slice(start, end), label: heading[1], link: heading[2], eol, markdown,
+        line: raw.slice(0, start).split('\n').length - 1, editable, text: editable ? markdown.slice(prefix.length, -2 * eol.length) : '' });
+    } catch { /* Malformed or externally restructured notes are never overwritten. */ }
+    finally { previousEnd = match.index + match[0].length; }
+  }
+  return entries;
+}
+function updatedEntry(edit, draft, sourceHash) {
+  const quotes = excerpts(draft), meta = { ...edit.meta, id: edit.meta?.id || randomUUID(), ...quotes[0],
+    quote: quotes[0]?.quote || '', before: quotes[0]?.before || '', after: quotes[0]?.after || '', excerpts: quotes, question: draft.question || '', sourceHash };
+  const eol = edit.eol || '\n';
+  const marker = Buffer.from(JSON.stringify(meta), 'utf8').toString('base64');
+  return notePrefix(edit.label, edit.link, meta.question, quotes, eol) + draft.text + eol + eol + `<!-- era:${marker} -->`;
+}
+function replaceEntry(raw, edit, next) {
+  const start = raw.indexOf(edit.original);
+  if (start < 0 || raw.indexOf(edit.original, start + 1) >= 0) throw Error('这条手札已在别处修改，未覆盖。当前修改仍保留，请核对后再保存。');
+  // Patch only the unchanged target entry; edits to other entries remain intact.
+  return raw.slice(0, start) + next + raw.slice(start + edit.original.length);
+}
 function decorate(el, block, blockId) {
-  const points = [...new Set([0, ...block.groups.flatMap(s => [s.start, s.end]), ...block.predicates.flatMap(s => [s.start, s.end]), ...block.sentences.flatMap(s => [s.start, s.end])])].sort((a, b) => a - b);
-  const segments = [];
   const starts = block.groups.map(s => s.start + s.text.search(/\S/));
+  const ends = block.groups.map(s => s.start + s.text.trimEnd().length);
+  const points = [...new Set([0, ...block.groups.flatMap(s => [s.start, s.end]), ...starts, ...ends, ...block.predicates.flatMap(s => [s.start, s.end]), ...block.sentences.flatMap(s => [s.start, s.end])])].sort((a, b) => a - b);
+  const segments = [];
   let g = 0, p = 0, sentence = 0;
   for (let i = 0; i < points.length - 1; i++) {
     const start = points[i], end = points[i + 1];
     while (g < block.groups.length && block.groups[g].end <= start) g++;
     while (p < block.predicates.length && block.predicates[p].end <= start) p++;
     while (sentence < block.sentences.length - 1 && block.sentences[sentence].end <= start) sentence++;
-    segments.push({ start, end, sentence: `${blockId}-${sentence}`, group: block.groups[g]?.start <= start ? g % 2 : -1, boundary: g > 0 ? starts[g] : -1, pred: block.predicates[p]?.start <= start ? block.predicates[p] : null });
+    segments.push({ start, end, sentence: `${blockId}-${sentence}`, group: starts[g] <= start && start < ends[g] ? g % 2 : -1, boundary: g > 0 ? starts[g] : -1, pred: block.predicates[p]?.start <= start ? block.predicates[p] : null });
   }
   let offset = 0, cursor = 0;
   for (const node of textNodes(el)) {
@@ -94,7 +146,11 @@ function decorate(el, block, blockId) {
 }
 
 class Reader extends ItemView {
-  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.generation = 0; this.layers = { groups: true, verbs: true }; this.grammarMode = 'backbone'; this.linkHistory = []; this.panel = 'notes'; }
+  constructor(leaf, plugin) {
+    super(leaf); this.plugin = plugin; this.generation = 0; this.layers = { groups: true, verbs: true }; this.grammarMode = 'backbone'; this.linkHistory = []; this.panel = 'notes';
+    this.scope = new Scope(this.app.scope);
+    this.scope.register(['Mod'], 'f', () => { this.openSearch(); return false; });
+  }
   getViewType() { return TYPE; }
   getDisplayText() { return this.file ? `阅读 · ${this.file.basename}` : '英文阅读助手'; }
   getIcon() { return 'book-open-text'; }
@@ -105,7 +161,7 @@ class Reader extends ItemView {
     await super.setState(state, result);
   }
   async onOpen() { this.contentEl.addClass('era-view'); }
-  async onClose() { this.generation++; this.child?.unload(); this.worker?.kill(); await this.plugin.flush(); }
+  async onClose() { this.generation++; if (this.article) this.clearSearchHighlight(); this.child?.unload(); this.worker?.kill(); await this.plugin.flush(); }
   draft() { return this.plugin.data.drafts[this.file.path] ||= { text: '', quote: '', before: '', after: '', question: '' }; }
   parkedDrafts() { return (this.plugin.data.parkedDrafts ||= {})[this.file.path] ||= []; }
   switchDraft(next) {
@@ -121,13 +177,24 @@ class Reader extends ItemView {
   showDraft() {
     const d = this.draft();
     this.editor.value = d.text;
-    this.quoteEl.textContent = d.quote || '选中正文，再点「摘录选文」。';
+    this.editingLabel.textContent = d.edit ? `正在编辑已保存手札 · ${d.edit.label}` : '';
+    this.editingLabel.hidden = !d.edit; this.exitEditingButton.hidden = !d.edit;
+    this.saveNoteButton.querySelector('.era-button-label').textContent = d.edit ? '更新这条手札' : '保存手札';
+    this.quoteEl.empty();
+    const items = excerpts(d);
+    if (!items.length) this.quoteEl.textContent = '选中正文，再点「摘录选文」。可连续添加多段。';
+    items.forEach((item, i) => {
+      const row = this.quoteEl.createDiv('era-excerpt');
+      row.createEl('blockquote', { text: item.quote });
+      this.button(row, `取消第 ${i + 1} 条摘录`, () => { setExcerpts(d, excerpts(d).filter((_, index) => index !== i)); this.showDraft(); this.plugin.scheduleFlush(); }, 'x').addClass('era-remove-excerpt');
+    });
     this.questionEl.textContent = d.question; this.questionEl.hidden = !d.question;
-    this.clearQuoteButton.hidden = !d.quote; this.clearQuestionButton.hidden = !d.question;
+    this.clearQuoteButton.hidden = !items.length; this.clearQuestionButton.hidden = !d.question;
+    if (this.preview) { this.preview.hidden = true; this.editor.hidden = false; this.previewButton?.setAttribute('aria-pressed', 'false'); }
     this.draftSelect.empty();
     const parked = this.parkedDrafts();
     this.draftSelect.createEl('option', { text: `暂存草稿（${parked.length}）`, value: '' });
-    parked.forEach((item, i) => this.draftSelect.createEl('option', { text: `${i + 1}. ${(item.question || item.quote || item.text).slice(0, 70)}`, value: String(i) }));
+    parked.forEach((item, i) => this.draftSelect.createEl('option', { text: `${i + 1}. ${item.edit ? '修改中 · ' : ''}${(item.question || item.quote || item.text).slice(0, 70)}`, value: String(i) }));
     this.draftSelect.hidden = !parked.length;
   }
   status(text, state = 'ready') { if (this.statusEl) { this.statusEl.textContent = text; this.statusEl.dataset.state = state; } }
@@ -141,7 +208,7 @@ class Reader extends ItemView {
         const result = action();
         if (result?.then) { button.disabled = true; button.setAttribute('aria-busy', 'true'); await result; }
       } catch (e) { this.status(e.message, 'error'); new Notice(e.message); }
-      finally { button.disabled = false; button.removeAttribute('aria-busy'); }
+      finally { button.disabled = button === this.undoLinkButton && !this.linkHistory.length; button.removeAttribute('aria-busy'); }
     });
     return button;
   }
@@ -174,7 +241,10 @@ class Reader extends ItemView {
     }
     const generation = ++this.generation;
     this.worker?.kill(); this.worker = null; this.analysisTask = null; this.analysisReady = false;
-    this.contentEl.empty(); this.child?.unload(); this.child = new Component(); this.child.load();
+    if (this.article) this.clearSearchHighlight();
+    this.searchHighlightStyle = null;
+    this.contentEl.empty(); this.contentEl.classList.remove('era-reading-started'); this.child?.unload(); this.child = new Component(); this.child.load();
+    this.lastWordRange = null; this.bracket = null;
     if (generation !== this.generation) return;
     this.sourceHash = hash(raw); this.sourceRaw = raw; this.stale = false; this.linkHistory = [];
     this.renderedPath = this.file.path;
@@ -187,6 +257,7 @@ class Reader extends ItemView {
     const links = header.createDiv('era-header-actions');
     this.button(links, '原文', () => this.app.workspace.openLinkText(this.file.path, '', true), 'file-text');
     this.button(links, '刷新', () => this.render(), 'refresh-cw');
+    this.button(links, '搜索正文', () => this.openSearch(), 'search');
     const bar = this.contentEl.createDiv('era-toolbar');
     this.analyzeButton = this.button(bar, '分析文章', () => this.analyze(), 'scan-text'); this.analyzeButton.addClass('era-primary');
     const toggles = bar.createDiv({ cls: 'era-layers', attr: { role: 'group', 'aria-label': '阅读辅助显示' } });
@@ -219,23 +290,55 @@ class Reader extends ItemView {
     const wordBar = bar.createDiv('era-word-actions');
     this.linkButton = this.button(wordBar, '标为双链', () => this.linkSelection(), 'link');
     this.linkButton.addEventListener('mousedown', e => e.preventDefault());
-    this.undoLinkButton = this.button(wordBar, '撤销标词', () => this.undoLink(), 'undo-2'); this.undoLinkButton.hidden = true;
+    this.undoLinkButton = this.button(wordBar, '撤销标词', () => this.undoLink(), 'undo-2'); this.undoLinkButton.disabled = true;
+    this.searchBar = this.contentEl.createDiv('era-search'); this.searchBar.hidden = true;
+    const searchBox = this.searchBar.createDiv('era-search-box');
+    setIcon(searchBox.createSpan({ cls: 'era-search-icon', attr: { 'aria-hidden': 'true' } }), 'search');
+    this.searchInput = searchBox.createEl('input', { attr: { type: 'text', placeholder: '在正文中查找…', 'aria-label': '搜索正文', autocomplete: 'off', spellcheck: 'false' } });
+    this.searchCount = searchBox.createSpan({ cls: 'era-search-count', attr: { role: 'status', 'aria-live': 'polite' } });
+    this.findPrevious = this.button(searchBox, '上一处（Shift+Enter）', () => this.findText(-1), 'chevron-up');
+    this.findNext = this.button(searchBox, '下一处（Enter）', () => this.findText(1), 'chevron-down');
+    this.findPrevious.disabled = this.findNext.disabled = true;
+    this.button(searchBox, '关闭搜索（Esc）', () => this.closeSearch(), 'x');
+    this.searchInput.addEventListener('input', () => this.findText(0));
+    this.searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); this.findText(e.shiftKey ? -1 : 1); } if (e.key === 'Escape') { e.preventDefault(); this.closeSearch(); } });
     this.layout = this.contentEl.createDiv('era-layout');
     this.article = this.layout.createDiv('era-article markdown-rendered');
     this.article.setAttribute('tabindex', '0');
     this.article.setAttribute('aria-label', '文章正文'); this.article.setAttribute('aria-busy', 'true');
     this.article.addEventListener('keydown', e => { if (e.key === 'Escape') this.clearSentence(); });
+    this.article.addEventListener('scroll', () => { if (this.article.scrollTop > 20) this.contentEl.classList.add('era-reading-started'); }, { passive: true });
+    const doc = this.article.ownerDocument;
+    this.child.registerDomEvent(doc, 'selectionchange', () => {
+      const s = doc.getSelection();
+      if (s?.rangeCount && !s.isCollapsed && this.article.contains(s.getRangeAt(0).commonAncestorContainer)) this.lastWordRange = s.getRangeAt(0).cloneRange();
+    });
+    this.article.addEventListener('mousedown', () => { this.lastWordRange = null; this.bracket = null; });
+    this.child.registerDomEvent(doc.defaultView, 'keydown', e => this.readerKey(e), true);
     const loading = this.article.createDiv({ cls: 'era-loading', text: '正在打开文章…' });
     this.syncLayers();
-    this.article.addEventListener('click', event => {
-      const anchor = event.target.closest('a.internal-link');
+    // Delegate to the article so freshly inserted links work without a rerender.
+    this.hoverPopover = null;
+    this.child.register(() => { this.hoverPopover?.unload(); this.hoverPopover = null; });
+    this.child.registerDomEvent(this.article, 'mouseover', event => {
+      const anchor = event.target.closest?.('a.internal-link');
+      const href = anchor?.getAttribute('data-href');
+      if (!href || this.linkWriting || event.buttons || (event.relatedTarget instanceof this.article.ownerDocument.defaultView.Node && anchor.contains(event.relatedTarget))) return;
+      this.app.workspace.trigger('hover-link', { event, source: TYPE, hoverParent: this, targetEl: anchor, linktext: href, sourcePath: this.file.path });
+    });
+    const openLink = event => {
+      if (event.type === 'auxclick' && event.button !== 1) return;
+      const anchor = event.target.closest?.('a.internal-link');
       const href = anchor?.getAttribute('data-href');
       if (!href) return;
       event.preventDefault(); event.stopPropagation();
+      const pane = Keymap.isModEvent(event);
       const target = href.startsWith('#^') ? this.article.querySelector(`[data-block-id="${CSS.escape(href.slice(2))}"]`) : null;
-      if (target) target.scrollIntoView({ block: 'start' });
-      else this.app.workspace.openLinkText(href, this.file.path, event.ctrlKey || event.metaKey).catch(e => { this.status(e.message, 'error'); new Notice(e.message); });
-    }, true);
+      if (target && !pane) target.scrollIntoView({ block: 'start' });
+      else this.app.workspace.openLinkText(href, this.file.path, pane).catch(e => { this.status(e.message, 'error'); new Notice(e.message); });
+    };
+    this.child.registerDomEvent(this.article, 'click', openLink, true);
+    this.child.registerDomEvent(this.article, 'auxclick', openLink, true);
     this.side = this.layout.createDiv('era-side');
     const tabs = this.side.createDiv({ cls: 'era-tabs', attr: { role: 'tablist', 'aria-label': '阅读笔记' } });
     for (const [key, label] of [['notes', '手札'], ['questions', '问题']]) {
@@ -249,17 +352,22 @@ class Reader extends ItemView {
     noteHeader.createEl('h3', { text: '读到这里，记下一点' });
     const captureButton = this.button(noteHeader, '摘录选文', () => this.capture(), 'text-quote');
     captureButton.addEventListener('mousedown', event => event.preventDefault());
-    this.quoteEl = this.notesPanel.createEl('blockquote', { cls: 'era-quote', text: this.draft().quote || '选中正文，再点「摘录选文」。' });
+    this.editingLabel = this.notesPanel.createDiv('era-editing-label'); this.editingLabel.hidden = true;
+    this.quoteEl = this.notesPanel.createDiv('era-quote');
     this.questionEl = this.notesPanel.createDiv({ cls: 'era-question-label', text: this.draft().question }); this.questionEl.hidden = !this.draft().question;
     this.editor = this.notesPanel.createEl('textarea', { attr: { placeholder: '自己的理解、一个疑问，\n或这道题的答案…', 'aria-label': '手札或问题回答' } });
     this.editor.value = this.draft().text;
     this.editor.addEventListener('input', () => { this.draft().text = this.editor.value; this.plugin.scheduleFlush(); });
+    this.editor.addEventListener('keydown', e => this.markdownKey(e));
+    this.preview = this.notesPanel.createDiv('era-note-preview markdown-rendered'); this.preview.hidden = true;
     const noteActions = this.notesPanel.createDiv('era-note-actions');
-    this.button(noteActions, '保存手札', () => this.saveNote(), 'check').addClass('era-primary');
+    this.saveNoteButton = this.button(noteActions, '保存手札', () => this.saveNote(), 'check'); this.saveNoteButton.addClass('era-primary');
     this.button(noteActions, '打开笔记', () => this.openNotes(), 'external-link');
+    this.previewButton = this.button(noteActions, 'Markdown 预览', () => this.togglePreview(), 'eye');
     const draftActions = this.notesPanel.createDiv('era-draft-actions');
+    this.exitEditingButton = this.button(draftActions, '暂存并退出编辑', () => this.switchDraft({}), 'corner-up-left'); this.exitEditingButton.hidden = true;
     this.button(draftActions, '新手札', () => this.switchDraft({}), 'plus');
-    this.clearQuoteButton = this.button(draftActions, '取消摘录', () => { Object.assign(this.draft(), { quote: '', before: '', after: '' }); this.showDraft(); this.plugin.scheduleFlush(); });
+    this.clearQuoteButton = this.button(draftActions, '取消全部摘录', () => { setExcerpts(this.draft(), []); this.showDraft(); this.plugin.scheduleFlush(); });
     this.clearQuestionButton = this.button(draftActions, '取消关联问题', () => { this.draft().question = ''; this.showDraft(); this.plugin.scheduleFlush(); });
     this.draftSelect = this.notesPanel.createEl('select', { cls: 'era-draft-select', attr: { 'aria-label': '恢复暂存草稿' } });
     this.draftSelect.addEventListener('change', () => { if (this.draftSelect.value !== '') this.switchDraft(this.parkedDrafts()[Number(this.draftSelect.value)]); });
@@ -270,6 +378,7 @@ class Reader extends ItemView {
     const body = raw.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/, '');
     const content = this.article.ownerDocument.createElement('div'); content.className = 'era-content';
     await MarkdownRenderer.render(this.app, body, content, this.file.path, this.child);
+    separateHeadings(content);
     if (generation !== this.generation) return;
     loading.replaceWith(content); this.article.removeAttribute('aria-busy');
     const blocks = this.app.metadataCache.getFileCache(this.file)?.blocks || {};
@@ -339,10 +448,63 @@ class Reader extends ItemView {
     const prefix = range.cloneRange(); prefix.selectNodeContents(this.article); prefix.setEnd(range.startContainer, range.startOffset);
     const pos = prefix.toString().length, text = this.article.textContent;
     const d = this.draft(), excerpt = { quote, before: text.slice(Math.max(0, pos - 60), pos), after: text.slice(pos + quote.length, pos + quote.length + 60) };
-    // A question's quote is evidence for its answer. Standalone excerpts get separate drafts.
-    if (!d.question && d.quote && ['quote', 'before', 'after'].some(key => d[key] !== excerpt[key])) {
-      this.switchDraft(this.parkedDrafts().find(item => !item.question && item.quote === quote && item.before === excerpt.before && item.after === excerpt.after) || excerpt);
-    } else { Object.assign(d, excerpt); this.switchDraft(d); }
+    const items = excerpts(d);
+    if (!items.some(item => ['quote', 'before', 'after'].every(key => item[key] === excerpt[key]))) setExcerpts(d, [...items, excerpt]);
+    this.switchDraft(d);
+  }
+  readerKey(e) {
+    if (this.app.workspace.activeLeaf?.view !== this || e.isComposing) return;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); e.stopImmediatePropagation(); this.openSearch(); return; }
+    if (e.target.closest?.('textarea,input,[contenteditable="true"]') || e.ctrlKey || e.metaKey || e.altKey) return;
+    const key = ({ '[': '[', '{': '{', ']': ']', '}': '}' })[e.key];
+    if (!key) { this.bracket = null; return; }
+    let word;
+    try { word = this.selectedWord(); } catch { this.bracket = null; return; }
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.repeat) return;
+    const previous = this.bracket;
+    this.bracket = { key, start: word.start, end: word.end, time: Date.now() };
+    if (previous?.key === key && previous.start === word.start && previous.end === word.end && Date.now() - previous.time < 1500) {
+      this.bracket = null;
+      this.linkSelection().catch(error => { this.status(error.message, 'error'); new Notice(error.message); });
+    }
+  }
+  openSearch() { this.searchBar.hidden = false; this.searchInput.focus({ preventScroll: true }); this.searchInput.select(); if (this.searchInput.value) this.findText(0); }
+  closeSearch() { this.searchBar.hidden = true; this.article.focus({ preventScroll: true }); this.clearSearchHighlight(); }
+  clearSearchHighlight() { this.article.ownerDocument.defaultView.CSS.highlights?.delete(`era-search-${this.leaf.id}`); }
+  findText(direction) {
+    const query = this.searchInput.value, text = this.article.textContent;
+    const hits = [];
+    if (query) {
+      const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      for (const match of text.matchAll(pattern)) hits.push({ start: match.index, end: match.index + match[0].length });
+    }
+    this.clearSearchHighlight();
+    this.searchIndex = !direction || this.searchQuery !== query ? 0 : ((this.searchIndex || 0) + direction + hits.length) % hits.length;
+    this.searchQuery = query;
+    this.searchCount.textContent = hits.length ? `${this.searchIndex + 1} / ${hits.length}` : query ? '无匹配' : '';
+    this.findPrevious.disabled = this.findNext.disabled = !hits.length;
+    if (!hits.length) return;
+    const hit = hits[this.searchIndex], range = this.textRange(hit.start, hit.end), win = this.article.ownerDocument.defaultView;
+    if (win.CSS.highlights && win.Highlight) win.CSS.highlights.set(`era-search-${this.leaf.id}`, new win.Highlight(range));
+    const style = this.searchHighlightStyle ||= this.contentEl.createEl('style');
+    style.textContent = `::highlight(era-search-${this.leaf.id}) { background-color: var(--text-highlight-bg); color: var(--text-normal); }`;
+    range.startContainer.parentElement.scrollIntoView({ block: 'center' });
+  }
+  markdownKey(e) {
+    if (!(e.ctrlKey || e.metaKey) || !['b', 'i'].includes(e.key.toLowerCase())) return;
+    e.preventDefault(); e.stopPropagation();
+    const token = e.key.toLowerCase() === 'b' ? '**' : '*', start = this.editor.selectionStart, end = this.editor.selectionEnd;
+    this.editor.setRangeText(token + this.editor.value.slice(start, end) + token, start, end, 'select');
+    this.editor.setSelectionRange(start + token.length, end + token.length);
+    this.draft().text = this.editor.value; this.plugin.scheduleFlush();
+  }
+  async togglePreview() {
+    if (!this.preview.hidden) { this.preview.hidden = true; this.editor.hidden = false; this.previewButton.setAttribute('aria-pressed', 'false'); this.editor.focus({ preventScroll: true }); return; }
+    this.preview.empty();
+    this.previewChild?.unload(); this.previewChild = new Component(); this.child.addChild(this.previewChild);
+    await MarkdownRenderer.render(this.app, this.draft().text || '*还没有写下内容。*', this.preview, this.plugin.notePath(this.file.path), this.previewChild);
+    this.preview.hidden = false; this.editor.hidden = true; this.previewButton.setAttribute('aria-pressed', 'true');
   }
   clearSentence() {
     for (const mark of this.article.querySelectorAll('[data-detail]')) delete mark.dataset.detail;
@@ -366,14 +528,16 @@ class Reader extends ItemView {
   }
   selectedWord() {
     const selection = this.article.ownerDocument.getSelection();
-    if (!selection?.rangeCount) throw Error('请先选中正文中的英文单词。');
-    const range = selection.getRangeAt(0);
+    const live = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    let range = live && !live.collapsed && this.article.contains(live.commonAncestorContainer) ? live : this.lastWordRange;
+    if (!range || range.collapsed) throw Error('请先选中正文中的英文单词。');
     if (!this.article.contains(range.startContainer) || !this.article.contains(range.endContainer)) throw Error('请在正文中选择单词。');
-    const quote = range.toString(); vocabTarget(quote);
+    const selected = range.toString(), quote = selected.trim(); vocabTarget(quote);
+    const prefix = range.cloneRange(); prefix.selectNodeContents(this.article); prefix.setEnd(range.startContainer, range.startOffset);
+    const start = prefix.toString().length + selected.length - selected.trimStart().length, text = this.article.textContent;
+    range = this.textRange(start, start + quote.length);
     const blocked = `${SKIP},a`;
     if ([range.startContainer, range.endContainer].some(n => (n.nodeType === 1 ? n : n.parentElement)?.closest(blocked)) || range.cloneContents().querySelector(blocked)) throw Error('已有链接、代码、公式和嵌入内容不能重复标词。');
-    const prefix = range.cloneRange(); prefix.selectNodeContents(this.article); prefix.setEnd(range.startContainer, range.startOffset);
-    const start = prefix.toString().length, text = this.article.textContent;
     if (/[a-z'-]/i.test(text[start - 1] || '') || /[a-z'-]/i.test(text[start + quote.length] || '')) throw Error('请选择完整单词。');
     return { quote, start, end: start + quote.length, text };
   }
@@ -405,14 +569,19 @@ class Reader extends ItemView {
       return candidates[hits[0][0]].start;
     } finally { child.unload(); }
   }
-  restoreSelection(start, end) {
+  textRange(start, end) {
     const nodes = [], walker = this.article.ownerDocument.createTreeWalker(this.article, 4);
     let offset = 0;
     for (let n; (n = walker.nextNode());) { nodes.push({ n, start: offset, end: offset + n.length }); offset += n.length; }
     const first = nodes.find(x => x.end > start), last = nodes.find(x => x.end >= end && x.start < end);
-    if (!first || !last) return;
+    if (!first || !last) throw Error('选区已变化，请重新选择。');
     const range = this.article.ownerDocument.createRange();
     range.setStart(first.n, start - first.start); range.setEnd(last.n, end - last.start);
+    return range;
+  }
+  restoreSelection(start, end) {
+    const range = this.textRange(start, end);
+    this.article.focus({ preventScroll: true });
     const selection = this.article.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range);
   }
   async linkSelection() {
@@ -447,7 +616,7 @@ class Reader extends ItemView {
       this.sourceRaw = after; this.sourceHash = hash(after); this.stale = false;
       this.article.classList.toggle('era-colors', !!this.analysisReady);
       this.linkHistory.push({ start, before: selected.quote, inserted, afterHash: hash(after), anchors, selection: selected });
-      this.undoLinkButton.hidden = false; this.restoreSelection(selected.start, selected.end); this.article.scrollTop = scroll;
+      this.undoLinkButton.disabled = false; this.restoreSelection(selected.start, selected.end); this.article.scrollTop = scroll;
       this.status(`已标为双链：${selected.quote} · 可撤销，继续阅读。`);
     } finally { this.linkWriting = false; }
   }
@@ -467,7 +636,7 @@ class Reader extends ItemView {
       for (const anchor of item.anchors) if (anchor.isConnected) anchor.replaceWith(...anchor.childNodes);
       this.sourceRaw = after; this.sourceHash = hash(after); this.stale = false;
       this.article.classList.toggle('era-colors', !!this.analysisReady);
-      this.linkHistory.pop(); this.undoLinkButton.hidden = !this.linkHistory.length;
+      this.linkHistory.pop(); this.undoLinkButton.disabled = !this.linkHistory.length;
       this.restoreSelection(item.selection.start, item.selection.end); this.article.scrollTop = scroll;
       this.status('已撤销上次标词。');
     } finally { this.linkWriting = false; }
@@ -491,42 +660,65 @@ class Reader extends ItemView {
   }
   async saveNote() {
     if (this.saving) return;
-    const original = this.draft(), d = { ...original };
+    const original = this.draft(), snapshot = JSON.stringify(original), d = JSON.parse(snapshot);
     if (!d.text.trim()) throw Error('先写下手札或回答再保存。');
     this.saving = true;
     try {
-      const note = await this.plugin.appendNote(this.file, d, this.sourceHash);
-      if (['text', 'quote', 'before', 'after', 'question'].every(key => original[key] === d[key])) {
-        if (this.draft() === original) Object.assign(original, { text: '', quote: '', before: '', after: '', question: '' });
+      const result = d.edit ? await this.plugin.updateNote(this.file, d) : { file: await this.plugin.appendNote(this.file, d, this.sourceHash) };
+      const note = result.file;
+      if (JSON.stringify(original) === snapshot) {
+        if (this.draft() === original) { Object.assign(original, { text: '', question: '' }); delete original.edit; setExcerpts(original, []); }
         else { const index = this.parkedDrafts().indexOf(original); if (index >= 0) this.parkedDrafts().splice(index, 1); }
         this.showDraft();
+      } else if (d.edit && original.edit?.original === d.edit.original) {
+        // A newer revision typed during save must use the just-written version as its baseline.
+        original.edit = { ...original.edit, ...result.edit };
       }
-      await this.plugin.flush(); await this.showSaved(); this.status(`已保存：${note.path}`);
+      await this.plugin.flush(); await this.showSaved(); this.status(`${d.edit ? '已更新原手札' : '已保存'}：${note.path}`);
       for (const card of this.side.querySelectorAll('.era-question')) if (card.querySelector('p').textContent === d.question) { card.querySelector('small').textContent = '已回答'; card.classList.add('era-answered'); }
     } finally { this.saving = false; }
   }
-  async openNotes() {
+  async openNotes(line = 0) {
     const file = this.app.vault.getAbstractFileByPath(this.plugin.notePath(this.file.path));
     if (!file) throw Error('尚未保存手札。');
-    return this.app.workspace.getLeaf(true).openFile(file);
+    return this.app.workspace.getLeaf('split', 'vertical').openFile(file, { state: { mode: 'source' }, eState: { line, focus: true } });
   }
   async showSaved() {
+    const expanded = this.saved.querySelector('details')?.open;
     this.saved.empty(); this.entries = [];
     const note = this.app.vault.getAbstractFileByPath(this.plugin.notePath(this.file.path));
     if (!note) return;
     await this.plugin.readyFile(note);
     const raw = await this.app.vault.read(note);
-    for (const match of raw.matchAll(/<!-- era:([A-Za-z0-9+/=]+) -->/g)) {
-      try {
-        const item = JSON.parse(Buffer.from(match[1], 'base64').toString('utf8'));
-        if (item && typeof item.quote === 'string') this.entries.push(item);
-      } catch { /* Leave user-edited malformed metadata untouched. */ }
+    this.entries = noteEntries(raw);
+    if (this.entries.length) {
+      const details = this.saved.createEl('details'); details.createEl('summary', { text: `已保存手札 · ${this.entries.length}` });
+      details.open = !!expanded;
+      this.button(details, '刷新已保存手札', () => this.showSaved(), 'refresh-cw');
+      for (const item of this.entries) {
+        const card = details.createEl('details', { cls: 'era-saved-entry' });
+        card.createEl('summary', { text: item.question || item.label });
+        this.button(card, '编辑这条手札', () => this.editSaved(item, note.path), 'pencil');
+        for (const quote of excerpts(item)) this.button(card, quote.quote.slice(0, 60) + (quote.quote.length > 60 ? '…' : ''), () => this.jumpQuote(quote), 'corner-up-left');
+        const preview = card.createDiv('markdown-rendered');
+        card.addEventListener('toggle', async () => {
+          if (!card.open || preview.childNodes.length) return;
+          try { await MarkdownRenderer.render(this.app, item.markdown, preview, note.path, this.child); }
+          catch (error) { this.status(error.message, 'error'); }
+        });
+      }
     }
-    const quotes = this.entries.filter(item => item.quote);
-    if (quotes.length) {
-      const details = this.saved.createEl('details'); details.createEl('summary', { text: `已保存摘录 · ${quotes.length}` });
-      for (const item of quotes) this.button(details, item.quote.slice(0, 60) + (item.quote.length > 60 ? '…' : ''), () => this.jumpQuote(item), 'corner-up-left');
-    }
+  }
+  editSaved(item, notePath = this.plugin.notePath(this.file.path)) {
+    if (!item.editable) throw Error('手札结构已在外部调整，无法安全分离正文。请先在「打开笔记」中核对，原内容未改动。');
+    const drafts = [this.draft(), ...this.parkedDrafts()];
+    const existing = drafts.find(d => d.edit?.path === notePath && (d.edit.original === item.original || (item.id && d.edit.meta?.id === item.id)));
+    if (existing) { this.switchDraft(existing); return; }
+    const edit = { path: notePath, original: item.original, label: item.label, link: item.link, eol: item.eol, meta: item.meta };
+    const next = { text: item.text, question: item.question || '', edit };
+    setExcerpts(next, JSON.parse(JSON.stringify(excerpts(item))));
+    this.switchDraft(next);
+    this.notesPanel.scrollTop = 0;
   }
   jumpQuote(item) {
     if (this.stale) throw Error('原文已变化，请先重新读取，再核对摘录。');
@@ -590,6 +782,7 @@ class ReadingPlugin extends Plugin {
     const runtime = await this.app.vault.adapter.exists(runtimePath) ? JSON.parse(await this.app.vault.adapter.read(runtimePath)) : {};
     this.pythonPath = runtime.pythonPath || path.join(this.app.vault.adapter.getBasePath(), this.manifest.dir, '.runtime', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
     this.registerView(TYPE, leaf => new Reader(leaf, this));
+    this.registerHoverLinkSource(TYPE, { display: this.manifest.name || '英文阅读助手', defaultMod: true });
     this.addCommand({ id: 'open-current', name: '为当前文章打开阅读助手', callback: () => this.open().catch(e => new Notice(e.message)) });
     for (const [id, name, method] of [['link-selection', '将阅读页选词标为双链', 'linkSelection'], ['undo-link', '撤销阅读页上次标词', 'undoLink'], ['detail-sentence', '分析阅读页当前句', 'detailSentence']]) {
       this.addCommand({ id, name, checkCallback: checking => {
@@ -602,6 +795,7 @@ class ReadingPlugin extends Plugin {
     this.addRibbonIcon('book-open-text', '为当前文章打开阅读助手', () => this.open().catch(e => new Notice(e.message)));
     this.registerEvent(this.app.vault.on('modify', file => {
       for (const leaf of this.app.workspace.getLeavesOfType(TYPE)) if (leaf.view.file?.path === file.path) {
+        if (leaf.view.linkWriting) continue; // The writer verifies the final bytes before keeping decorations.
         leaf.view.stale = true; leaf.view.article?.classList.remove('era-colors'); leaf.view.status('原文有更新 · 点击「刷新」后继续。');
       }
     }));
@@ -641,14 +835,29 @@ class ReadingPlugin extends Plugin {
     return this.pending;
   }
   notePath(source) { return this.data.notes[source] || `Notes/reading-notes/reading-${hash(source).slice(0, 16)}.md`; }
+  async updateNote(source, draft) {
+    const edit = draft.edit;
+    if (edit.path !== this.notePath(source.path)) throw Error('手札路径已变化，请核对后再保存。');
+    const file = this.app.vault.getAbstractFileByPath(edit.path);
+    await this.readyFile(source); await this.readyFile(file);
+    const next = updatedEntry(edit, draft, edit.meta?.sourceHash || '');
+    await this.app.vault.process(file, raw => replaceEntry(raw, edit, next).replace(/^modified:.*$/m, `modified: ${today()}`));
+    const current = await this.app.vault.read(file);
+    if (!current.includes(next)) throw Error('保存后手札又有变化，请核对。当前编辑仍保留。');
+    const item = noteEntries(next)[0];
+    if (!item?.editable) throw Error('更新后的手札结构需要核对，当前编辑仍保留。');
+    return { file, edit: { ...edit, original: next, meta: item.meta } };
+  }
   async appendNote(source, draft, sourceHash) {
     await this.readyFile(source);
     const target = this.notePath(source.path), date = today();
     await this.mkdir('Notes/reading-notes');
     const link = this.app.fileManager.generateMarkdownLink(source, target);
-    const item = { quote: draft.quote, before: draft.before, after: draft.after, question: draft.question, sourceHash };
+    const quotes = excerpts(draft);
+    const item = { id: randomUUID(), ...quotes[0], quote: quotes[0]?.quote || '', excerpts: quotes, question: draft.question, sourceHash };
     const marker = Buffer.from(JSON.stringify(item), 'utf8').toString('base64');
-    const entry = `\n## ${new Date().toLocaleString('zh-CN')}\n\n来源：${link}\n\n${draft.question ? `问题：${draft.question}\n\n` : ''}${draft.quote ? draft.quote.split('\n').map(line => `> ${line}`).join('\n') + '\n\n' : ''}${draft.text}\n\n<!-- era:${marker} -->\n`;
+    const quoted = quotes.map(item => item.quote.split('\n').map(line => `> ${line}`).join('\n')).join('\n\n');
+    const entry = `\n## ${new Date().toLocaleString('zh-CN')}\n\n来源：${link}\n\n${draft.question ? `问题：${draft.question}\n\n` : ''}${quoted ? quoted + '\n\n' : ''}${draft.text}\n\n<!-- era:${marker} -->\n`;
     let file = this.app.vault.getAbstractFileByPath(target);
     if (file) {
       await this.readyFile(file);
@@ -677,4 +886,4 @@ class ReadingPlugin extends Plugin {
   onunload() { this.app.workspace.detachLeavesOfType(TYPE); this.flush().catch(e => console.error('阅读助手草稿保存失败', e)); }
 }
 module.exports = ReadingPlugin;
-module.exports.checks = { valid, locate, hash, vocabTarget, linkCandidates, applyLinkPatch };
+module.exports.checks = { valid, locate, hash, vocabTarget, linkCandidates, applyLinkPatch, noteEntries, updatedEntry, replaceEntry };

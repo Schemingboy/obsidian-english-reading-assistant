@@ -1,6 +1,6 @@
-"""Run: python check-colors.py. Check neutral layers, text and boundary contrast.
+"""Run: python check-colors.py. Check cool/warm layers and text contrast.
 
-Neutral-chroma and lightness thresholds are project regression checks,
+Hue-separation thresholds are project regression checks,
 not WCAG rules or a numerical guarantee of aesthetic harmony.
 """
 from pathlib import Path
@@ -48,18 +48,19 @@ def check():
         ratios = [contrast(ink, bg) for ink in inks for bg in groups]
         boundaries = [contrast(rgb(values['boundary']), bg) for bg in groups]
         chroma = [math.hypot(*lab(bg)[1:]) for bg in groups]
-        lightness = abs(lab(groups[0])[0] - lab(groups[1])[0])
+        separation = math.dist(lab(groups[0]), lab(groups[1]))
         assert min(ratios) >= 4.5, (theme, 'text contrast', ratios)
         assert min(boundaries) >= 3, (theme, 'boundary contrast', boundaries)
-        assert max(chroma) <= 10, (theme, 'background must remain neutral', chroma)
-        assert lightness >= 5, (theme, 'alternating lightness', lightness)
-        assert values['main'] == values['subordinate'], 'Finite verbs share one accent hue.'
-        assert 'data-group-start' in css and 'content: \'\'' in css, 'Group boundaries must have a non-color cue.'
+        assert separation >= 15, (theme, 'cool/warm separation', separation)
+        assert max(chroma) <= 35, (theme, 'restrained background chroma', chroma)
+        assert lab(groups[0])[1] < -5 and lab(groups[1])[2] > 10, (theme, 'teal/sand hue roles')
+        assert values['main'] != values['subordinate'], 'Main verbs need their own emphasis.'
+        assert 'data-group-start] { margin-inline-start: .10em;' in css, 'Group boundaries retain spacing without inserted text.'
         results[theme] = {'groups': [values[f'group-{i}'] for i in range(2)],
                           'minimumTextContrast': round(min(ratios), 2),
                           'minimumBoundaryContrast': round(min(boundaries), 2),
                           'maximumBackgroundChroma': round(max(chroma), 2),
-                          'lightnessDifference': round(lightness, 2)}
+                          'coolWarmDeltaE76': round(separation, 2)}
     return results
 
 

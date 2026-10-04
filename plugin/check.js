@@ -1,15 +1,18 @@
 // Run: node check.js. Uses the actual plugin helpers with only Obsidian's host classes stubbed.
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
-const sandbox = { module: { exports: {} }, process, require: name => name === 'obsidian' ? { Plugin: class {
+const sandbox = { module: { exports: {} }, process, Buffer, require: name => name === 'obsidian' ? { Plugin: class {
   registerView() {} addCommand() {} addRibbonIcon() {} registerEvent() {}
+  registerHoverLinkSource(id, options) { this.hoverSource = { id, options }; }
 }, ItemView: class {} } : require(name) };
 vm.runInNewContext(fs.readFileSync(__dirname + '/main.js', 'utf8'), sandbox);
 const { valid, locate, hash, vocabTarget, linkCandidates, applyLinkPatch } = sandbox.module.exports.checks;
+const { noteEntries, updatedEntry, replaceEntry } = sandbox.module.exports.checks;
 assert.equal(locate('same same', 'same'), -1);
 assert.equal(locate('one same two same end', 'same', 'two ', ' end'), 13);
 assert.equal(locate('changed', 'old'), -1);
 assert.equal(locate('a unique sentence', 'unique'), 2);
-const good = { version: 'spacy-en-sm-3.8.0-r2', blocks: [{ groups: [{ start: 0, end: 5, text: 'hello' }], predicates: [], sentences: [{ start: 0, end: 5, text: 'hello' }] }] };
+const good = { version: 'spacy-en-sm-3.8.0-r4', blocks: [{ groups: [{ start: 0, end: 5, text: 'hello' }], predicates: [], sentences: [{ start: 0, end: 5, text: 'hello' }] }] };
+assert(!valid({ ...good, version: 'spacy-en-sm-3.8.0-r3' }, ['hello']));
 assert(valid(good, ['hello']));
 assert(!valid(good, ['world']));
 good.blocks[0].groups[0].end = 50;
@@ -37,6 +40,9 @@ console.log('PASS: safe vocabulary target, frontmatter/link exclusions, exact oc
   const reads = [];
   plugin.app = { vault: { on() {}, adapter: { exists: async () => false, read: async path => { reads.push(path); throw Error('Unexpected read'); }, getBasePath: () => '/test-vault' } } };
   await plugin.onload();
+  assert.equal(plugin.hoverSource.id, 'english-reading-assistant');
+  assert.equal(plugin.hoverSource.options.defaultMod, true);
+  assert.equal(plugin.hoverSource.options.display, '英文阅读助手');
   assert.equal(plugin.questions.length, 0);
   assert.equal(reads.length, 0);
   assert(plugin.pythonPath.includes('.runtime'));
@@ -45,4 +51,40 @@ console.log('PASS: safe vocabulary target, frontmatter/link exclusions, exact oc
   await plugin.onload();
   assert.equal(plugin.pythonPath, '/custom/python');
   console.log('PASS: clean install needs no personal question bank; explicit local Python configuration supported.');
+  let saved = '';
+  plugin.readyFile = async () => {};
+  plugin.app.fileManager = { generateMarkdownLink: () => '[[article]]' };
+  plugin.app.vault.adapter.exists = async () => true;
+  plugin.app.vault.getAbstractFileByPath = () => null;
+  plugin.app.vault.create = async (path, text) => { saved = text; return { path }; };
+  const source = { path: 'article.md', basename: 'Article' };
+  await plugin.appendNote(source, { text: '**Legacy answer**', quote: 'Old quote', before: 'a', after: 'b', question: '' }, 'source-hash');
+  assert(saved.includes('> Old quote') && saved.includes('**Legacy answer**'));
+  const decode = () => JSON.parse(Buffer.from(saved.match(/<!-- era:([A-Za-z0-9+/=]+) -->/)[1], 'base64').toString('utf8'));
+  assert.equal(decode().excerpts[0].quote, 'Old quote');
+  await plugin.appendNote(source, { text: '## Answer\n\n- Evidence', question: 'Why?', excerpts: [{ quote: 'First\nparagraph', before: '', after: '' }, { quote: 'Second passage', before: '', after: '' }] }, 'source-hash');
+  assert(saved.includes('> First\n> paragraph\n\n> Second passage'));
+  assert(saved.includes('## Answer\n\n- Evidence'));
+  assert.equal(decode().excerpts.length, 2);
+  assert.equal(decode().quote, 'First\nparagraph');
+  console.log('PASS: legacy draft migration and multi-excerpt Markdown persist without losing formatting or source locators.');
+  const original = noteEntries(saved)[0];
+  assert(original.editable);
+  assert.equal(original.text, '## Answer\n\n- Evidence');
+  const updated = updatedEntry(original, { text: '**Revised**\n\n## Nested heading\n\nMore evidence.', question: 'Why?', excerpts: original.excerpts }, 'source-hash');
+  assert.throws(() => replaceEntry(saved.replace('- Evidence', '- External edit'), original, updated));
+  assert.throws(() => replaceEntry(original.original + original.original, original, updated));
+  const other = '\n\n## An unrelated note\n\nKeep this verbatim.\n';
+  const replaced = replaceEntry(saved + other, original, updated);
+  assert(replaced.endsWith(other));
+  assert.equal(noteEntries(replaced).length, 1);
+  assert.equal(noteEntries(replaced)[0].text, '**Revised**\n\n## Nested heading\n\nMore evidence.');
+  assert.equal(noteEntries(replaced)[0].id, original.id);
+  assert.equal(noteEntries(saved.replace('问题：Why?', '问题：Changed externally'))[0].editable, false);
+  const crlf = saved.replace(/\n/g, '\r\n');
+  assert(noteEntries(crlf)[0].editable);
+  assert.equal(noteEntries(crlf)[0].text, '## Answer\r\n\r\n- Evidence');
+  const broken = saved.replace(/<!-- era:[A-Za-z0-9+/=]+ -->/, '<!-- era:invalid -->');
+  assert.equal(noteEntries(broken).length, 0);
+  console.log('PASS: saved-note updates reject conflicts/ambiguity, preserve other content, support Markdown headings and CRLF, and retain stable identity.');
 })().catch(error => { console.error(error); process.exitCode = 1; });
