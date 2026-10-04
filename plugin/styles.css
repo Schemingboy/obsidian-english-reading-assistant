@@ -3,7 +3,7 @@
   --era-subordinate: #285c7e;
   --era-nonfinite: #7a5130;
   --era-group-0: #f7f7f5;
-  --era-group-1: #e5e7e9;
+  --era-group-1: #dfe4e8;
   --era-boundary: #777f85;
   --era-paper: var(--background-primary);
   --era-panel: var(--background-secondary);
@@ -21,8 +21,8 @@
   --era-subordinate: #9ebed5;
   --era-nonfinite: #cfb38f;
   --era-group-0: #252b30;
-  --era-group-1: #333b42;
-  --era-boundary: #828f99;
+  --era-group-1: #39434b;
+  --era-boundary: #94a2ad;
 }
 .era-view [hidden] { display: none !important; }
 .era-view > :is(.era-header,.era-toolbar,.era-legend,.era-status,.era-layout) { width: 100%; max-width: 1040px; align-self: center; }
@@ -77,12 +77,27 @@
 .era-colors.era-groups .era-mark[data-group="0"] { background-color: var(--era-group-0); }
 .era-colors.era-groups .era-mark[data-group="1"] { background-color: var(--era-group-1); }
 .era-colors.era-groups .era-mark[data-group-start]::before {
-  content: ''; display: inline-block; height: .65em; vertical-align: .02em;
-  border-inline-start: 1px solid var(--era-boundary); margin-inline: .16em;
+  content: ''; display: inline-block; height: .7em; vertical-align: .02em;
+  border-inline-start: 1.5px solid var(--era-boundary); margin-inline: .2em;
 }
 .era-colors.era-verbs [data-role="main"], .era-legend [data-role="main"] { color: var(--era-main); text-decoration: underline solid; font-weight: 600; text-underline-offset: 4px; text-decoration-thickness: 1px; }
 .era-colors.era-verbs [data-role="subordinate"], .era-legend [data-role="subordinate"] { color: var(--era-subordinate); text-decoration: underline double; text-underline-offset: 4px; text-decoration-thickness: 1px; }
 .era-colors.era-verbs [data-role="nonfinite"], .era-legend [data-role="nonfinite"] { color: var(--era-nonfinite); text-decoration: underline dashed; text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.era-colors.era-verbs.era-backbone [data-role="subordinate"]:not([data-detail]) { text-decoration: none; }
+.era-colors.era-verbs.era-backbone [data-role="nonfinite"]:not([data-detail]) { color: inherit; text-decoration: none; }
+.era-legend.era-backbone [data-role="nonfinite"] { display: none; }
+.era-legend.era-backbone [data-role="subordinate"] { text-decoration: none; }
+.era-mark[data-detail] { box-shadow: inset 0 -1px var(--era-boundary); }
+.era-mark a.internal-link { color: inherit; }
+.era-word-actions { display: flex; align-items: center; gap: 2px; }
+.era-grammar-select { max-width: 110px; height: 27px; font-size: 12px; padding-block: 0; border: 0; background: var(--era-paper); box-shadow: none; }
+.era-grammar-select:focus-visible, .era-goal input:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
+.era-view > .era-goal { width: 100%; max-width: 1040px; box-sizing: border-box; margin: 0 auto; padding: 0 32px 8px; font-size: 12px; color: var(--text-muted); }
+.era-view:has(.era-focus) > .era-goal { max-width: 740px; }
+.era-goal summary { cursor: pointer; overflow-wrap: anywhere; line-height: 1.5; }
+.era-goal:not([open]) summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.era-goal-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 8px; }
+.era-goal input { flex: 1 1 210px; min-width: 0; width: 100%; font-size: 13px; }
 .era-side { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-left: 1px solid var(--era-line); background: var(--era-panel); }
 .era-tabs { display: flex; gap: 18px; padding: 8px 18px 0; border-bottom: 1px solid var(--era-line); }
 .era-view .era-tabs .era-button { height: 38px; border-radius: 0; padding-inline: 4px; border-bottom: 2px solid transparent; }
@@ -115,6 +130,7 @@
 .era-focus .era-side { display: none; }
 .era-loading { color: var(--text-muted); font: 13px/1.6 var(--font-interface); padding-top: 16px; }
 @container (max-width: 900px) {
+  .era-view > .era-goal { padding-inline: 22px; }
   .era-view > :is(.era-header,.era-toolbar,.era-legend,.era-status) { padding-inline: 22px; }
   .era-layout { grid-template-columns: minmax(0, 1fr) 260px; }
   .era-header { padding: 14px 16px 10px; gap: 10px; }

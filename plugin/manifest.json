@@ -1,7 +1,7 @@
 {
   "id": "english-reading-assistant",
   "name": "英文阅读助手",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "minAppVersion": "1.8.0",
   "description": "为当前 Markdown 打开本地意群阅读、独立手札和 Focus Questions。",
   "author": "Gragon",

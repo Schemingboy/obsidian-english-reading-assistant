@@ -2,7 +2,7 @@
 import json
 import sys
 
-VERSION = "spacy-en-sm-3.8.0-r1"
+VERSION = "spacy-en-sm-3.8.0-r2"
 
 
 def analyze(nlp, texts):
@@ -17,6 +17,7 @@ def analyze(nlp, texts):
             return dict(start=offsets[start], end=offsets[end], text=text[start:end], **extra)
 
         verbs = []
+        chains = []
         for token in doc:
             if token.pos_ not in ("VERB", "AUX") or token.dep_ in ("aux", "auxpass"):
                 continue
@@ -37,38 +38,66 @@ def analyze(nlp, texts):
                 head = head.head
             role = ("main" if head.dep_ == "ROOT" else "subordinate") if finite else "nonfinite"
             explanation = " ".join(t.text for t in chain)
+            chains.append((chain[0].idx, chain[-1].idx + len(chain[-1])))
             for part in chain:
                 verbs.append(span(part.idx, part.idx + len(part), role=role, chain=explanation))
 
         cuts = {0, len(text)}
+        sentences = []
         for sentence in doc.sents:
+            sentences.append(span(sentence.start_char, sentence.end_char))
             cuts.add(sentence.start_char)
             cuts.add(sentence.end_char)
+            # Keep subordinate clauses intact at reading scale. Nested clauses stay
+            # inside their parent; relative clauses stay with the noun they describe.
+            clauses = []
+            relatives = []
+            for token in sentence:
+                if token.dep_ in ("advcl", "ccomp", "relcl", "acl"):
+                    subtree = list(token.subtree)
+                    bounds = (min(t.idx for t in subtree), max(t.idx + len(t) for t in subtree))
+                    (relatives if token.dep_ in ("relcl", "acl") else clauses).append(bounds)
+            outer = [(a, b) for a, b in clauses if not any(c <= a and b <= d and (c, d) != (a, b) for c, d in clauses + relatives)]
+            protected = outer + relatives + chains
+            def inside(pos):
+                return any(a < pos < b for a, b in protected)
+            def cut(pos):
+                if not inside(pos):
+                    cuts.add(pos)
+            for start, end in outer:
+                cut(start)
+                cut(end)
             for token in sentence:
                 if token.text in (",", ";", ":", "—"):
-                    cuts.add(token.idx + len(token))
-                # Phrase boundaries come from dependencies, never punctuation alone.
-                if token.dep_ in ("advcl", "relcl", "ccomp", "prep", "agent"):
+                    cut(token.idx + len(token))
+                if token.dep_ in ("prep", "agent") and token.head.dep_ in ("ROOT", "conj"):
                     subtree = list(token.subtree)
                     if len(subtree) >= 3:
-                        cuts.add(min(t.idx for t in subtree))
+                        cut(min(t.idx for t in subtree))
                 if token.dep_ in ("nsubj", "nsubjpass"):
+                    subtree = list(token.subtree)
                     right = max(t.idx + len(t) for t in token.subtree)
-                    if right < token.head.idx:
-                        cuts.add(right)
-        boundaries = sorted(cuts)
+                    if len(subtree) >= 3 and right < token.head.idx:
+                        cut(right)
+        # Attach punctuation and following spaces to the preceding group. Never
+        # merge a short clause into its neighbour merely to satisfy a word count.
+        normalized = {0, len(text)}
+        for pos in cuts:
+            if pos == 0:
+                continue
+            while pos < len(text) and (text[pos].isspace() or text[pos] in ",;:.!?—"):
+                pos += 1
+            normalized.add(pos)
+        boundaries = sorted(normalized)
         chunks = []
         start = 0
-        # ponytail: merge very short dependency fragments; no claim of one unique linguistic segmentation.
         for end in boundaries[1:]:
-            if len(text[start:end].split()) < 3 and end != len(text) and not text[start:end].rstrip().endswith((".", "?", "!", ";")):
-                continue
             if text[start:end].strip():
                 chunks.append(span(start, end))
                 start = end
         if chunks and start < len(text):
             chunks[-1] = span(next(i for i, v in enumerate(offsets) if v == chunks[-1]["start"]), len(text))
-        results.append(dict(groups=chunks, predicates=sorted(verbs, key=lambda s: s["start"])))
+        results.append(dict(groups=chunks, predicates=sorted(verbs, key=lambda s: s["start"]), sentences=sentences))
     return dict(version=VERSION, blocks=results)
 
 

@@ -1,10 +1,10 @@
 const { Plugin, ItemView, MarkdownRenderer, Component, Notice, TFile, setIcon } = require('obsidian');
 const { spawn } = require('child_process');
 const path = require('path');
-const { createHash } = require('crypto');
+const { createHash, randomUUID } = require('crypto');
 const { setImmediate } = require('timers');
 const TYPE = 'english-reading-assistant';
-const VERSION = 'spacy-en-sm-3.8.0-r1';
+const VERSION = 'spacy-en-sm-3.8.0-r2';
 const hash = text => createHash('sha256').update(text).digest('hex');
 const today = () => new Date().toLocaleDateString('sv-SE');
 const roles = { main: '主句谓语', subordinate: '从句谓语', nonfinite: '非谓语动词' };
@@ -19,7 +19,7 @@ function textNodes(el) {
 }
 function valid(result, texts) {
   if (result?.version !== VERSION || result.blocks?.length !== texts.length) return false;
-  return result.blocks.every((block, i) => ['groups', 'predicates'].every(key => {
+  return result.blocks.every((block, i) => ['groups', 'predicates', 'sentences'].every(key => {
     if (!Array.isArray(block[key])) return false;
     let end = 0;
     return block[key].every(s => {
@@ -37,16 +37,36 @@ function locate(text, quote, before = '', after = '') {
   const contextual = hits.filter(i => (!before || text.slice(Math.max(0, i - before.length), i) === before) && (!after || text.slice(i + quote.length, i + quote.length + after.length) === after));
   return contextual.length === 1 ? contextual[0] : -1;
 }
-function decorate(el, block) {
-  const points = [...new Set([0, ...block.groups.flatMap(s => [s.start, s.end]), ...block.predicates.flatMap(s => [s.start, s.end])])].sort((a, b) => a - b);
+function vocabTarget(text) {
+  if (!/^[a-z]+(?:[-'][a-z]+)*(?: [a-z]+(?:[-'][a-z]+)*){0,2}$/i.test(text) || text.length > 80) throw Error('请选择完整的英文单词或最多三个词的短语。');
+  return text.toLowerCase();
+}
+function linkCandidates(raw, quote, cache) {
+  const frontmatter = raw.match(/^\uFEFF?---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/)?.[0].length || 0;
+  const excluded = [...(cache.links || []), ...(cache.embeds || []), ...(cache.sections || []).filter(s => ['code', 'yaml', 'html'].includes(s.type))].map(s => [s.position.start.offset, s.position.end.offset]);
+  const hits = [];
+  for (let start = raw.indexOf(quote, frontmatter); start >= 0; start = raw.indexOf(quote, start + quote.length)) {
+    const end = start + quote.length;
+    if (/[a-z'\\-]/i.test(raw[start - 1] || '') || /[a-z'-]/i.test(raw[end] || '') || excluded.some(([a, b]) => start < b && end > a)) continue;
+    hits.push({ start, end });
+  }
+  return hits;
+}
+function applyLinkPatch(raw, expectedHash, start, before, after) {
+  if (hash(raw) !== expectedHash || raw.slice(start, start + before.length) !== before) throw Error('原文已变化，本次未写入。请刷新后重新选择。');
+  return raw.slice(0, start) + after + raw.slice(start + before.length);
+}
+function decorate(el, block, blockId) {
+  const points = [...new Set([0, ...block.groups.flatMap(s => [s.start, s.end]), ...block.predicates.flatMap(s => [s.start, s.end]), ...block.sentences.flatMap(s => [s.start, s.end])])].sort((a, b) => a - b);
   const segments = [];
   const starts = block.groups.map(s => s.start + s.text.search(/\S/));
-  let g = 0, p = 0;
+  let g = 0, p = 0, sentence = 0;
   for (let i = 0; i < points.length - 1; i++) {
     const start = points[i], end = points[i + 1];
     while (g < block.groups.length && block.groups[g].end <= start) g++;
     while (p < block.predicates.length && block.predicates[p].end <= start) p++;
-    segments.push({ start, end, group: block.groups[g]?.start <= start ? g % 2 : -1, boundary: g > 0 ? starts[g] : -1, pred: block.predicates[p]?.start <= start ? block.predicates[p] : null });
+    while (sentence < block.sentences.length - 1 && block.sentences[sentence].end <= start) sentence++;
+    segments.push({ start, end, sentence: `${blockId}-${sentence}`, group: block.groups[g]?.start <= start ? g % 2 : -1, boundary: g > 0 ? starts[g] : -1, pred: block.predicates[p]?.start <= start ? block.predicates[p] : null });
   }
   let offset = 0, cursor = 0;
   for (const node of textNodes(el)) {
@@ -62,6 +82,7 @@ function decorate(el, block) {
       const mark = el.ownerDocument.createElement('span');
       mark.className = 'era-mark';
       mark.textContent = text;
+      mark.dataset.sentence = segment.sentence;
       if (segment.group >= 0) mark.dataset.group = String(segment.group);
       if (segment.boundary >= pos && segment.boundary < stop) mark.dataset.groupStart = 'true';
       const pred = segment.pred;
@@ -73,7 +94,7 @@ function decorate(el, block) {
 }
 
 class Reader extends ItemView {
-  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.generation = 0; this.layers = { groups: true, verbs: true }; this.panel = 'notes'; }
+  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.generation = 0; this.layers = { groups: true, verbs: true }; this.grammarMode = 'backbone'; this.linkHistory = []; this.panel = 'notes'; }
   getViewType() { return TYPE; }
   getDisplayText() { return this.file ? `阅读 · ${this.file.basename}` : '英文阅读助手'; }
   getIcon() { return 'book-open-text'; }
@@ -139,8 +160,13 @@ class Reader extends ItemView {
       this[`${key}Button`].setAttribute('aria-pressed', String(this.layers[key]));
       this[`${key}Button`].disabled = !this.analysisReady;
     }
+    this.article.classList.toggle('era-backbone', this.grammarMode === 'backbone');
+    if (this.legend) this.legend.classList.toggle('era-backbone', this.grammarMode === 'backbone' && !this.article.querySelector('[data-detail]'));
+    if (this.grammarSelect) this.grammarSelect.disabled = !this.analysisReady || !this.layers.verbs;
+    if (this.sentenceButton) this.sentenceButton.disabled = !this.analysisReady;
   }
   async render() {
+    if (this.linkWriting) throw Error('正在保存标词，请稍后刷新。');
     await this.plugin.readyFile(this.file);
     const raw = await this.app.vault.read(this.file);
     if (this.renderedPath === this.file.path && this.sourceHash === hash(raw) && this.article?.isConnected) {
@@ -150,12 +176,13 @@ class Reader extends ItemView {
     this.worker?.kill(); this.worker = null; this.analysisTask = null; this.analysisReady = false;
     this.contentEl.empty(); this.child?.unload(); this.child = new Component(); this.child.load();
     if (generation !== this.generation) return;
-    this.sourceHash = hash(raw); this.stale = false;
+    this.sourceHash = hash(raw); this.sourceRaw = raw; this.stale = false; this.linkHistory = [];
     this.renderedPath = this.file.path;
     const header = this.contentEl.createDiv('era-header');
     const title = header.createDiv('era-title');
     title.createSpan({ cls: 'era-eyebrow', text: '英文精读' });
-    const displayTitle = this.app.metadataCache.getFileCache(this.file)?.frontmatter?.title || this.file.basename;
+    const metadata = this.app.metadataCache.getFileCache(this.file);
+    const displayTitle = metadata?.frontmatter?.title || metadata?.headings?.find(h => h.level === 1)?.heading || this.file.basename;
     title.createEl('h2', { text: String(displayTitle), attr: { title: String(displayTitle) } });
     const links = header.createDiv('era-header-actions');
     this.button(links, '原文', () => this.app.workspace.openLinkText(this.file.path, '', true), 'file-text');
@@ -166,17 +193,38 @@ class Reader extends ItemView {
     for (const [key, label, icon] of [['groups', '意群', 'align-left'], ['verbs', '谓语与非谓语', 'baseline']]) {
       this[`${key}Button`] = this.button(toggles, label, () => { this.layers[key] = !this.layers[key]; this.syncLayers(); }, icon);
     }
+    this.grammarSelect = toggles.createEl('select', { cls: 'era-grammar-select', attr: { 'aria-label': '语法提示层次' } });
+    for (const [value, text] of [['backbone', '阅读主干'], ['full', '完整分析']]) this.grammarSelect.createEl('option', { value, text });
+    this.grammarSelect.value = this.grammarMode;
+    this.grammarSelect.addEventListener('change', () => { this.grammarMode = this.grammarSelect.value; this.syncLayers(); });
+    this.sentenceButton = this.button(bar, '分析当前句', () => this.detailSentence(), 'text-cursor-input');
+    this.sentenceButton.addEventListener('mousedown', e => e.preventDefault());
+    this.sentenceButton.addEventListener('keydown', e => { if (e.key === 'Escape') this.clearSentence(); });
     this.focusButton = this.button(bar, '专注阅读', () => { const focus = this.layout.classList.toggle('era-focus'); this.focusButton.setAttribute('aria-pressed', String(focus)); }, 'panel-right-close');
     this.focusButton.setAttribute('aria-pressed', 'false');
-    const legend = this.contentEl.createDiv('era-legend');
+    const legend = this.legend = this.contentEl.createDiv('era-legend');
     const swatches = legend.createSpan('era-swatches'); for (let i = 0; i < 2; i++) swatches.createSpan({ attr: { 'data-group': String(i), 'aria-hidden': 'true' } });
     legend.createSpan({ text: '意群分段' });
     for (const [role, label] of Object.entries(roles)) legend.createSpan({ text: label, attr: { 'data-role': role } });
+    this.goal = this.contentEl.createEl('details', { cls: 'era-goal' });
+    this.goalSummary = this.goal.createEl('summary');
+    const goalActions = this.goal.createDiv('era-goal-actions');
+    this.goalInput = goalActions.createEl('input', { attr: { type: 'text', maxlength: '500', placeholder: '这篇文章，我想弄懂什么？', 'aria-label': '当前阅读问题' } });
+    this.button(goalActions, '设为目标', () => this.setGoal(this.goalInput.value));
+    this.button(goalActions, '写回答', () => { const q = this.readingGoal(); if (!q) throw Error('先写下或从问题中选择一个目标。'); this.answerQuestion(q); });
+    this.button(goalActions, '清除', () => this.setGoal(''));
+    this.goalInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); this.setGoal(this.goalInput.value); } });
+    this.showGoal();
     this.statusEl = this.contentEl.createDiv({ cls: 'era-status', text: '选择「分析文章」开启阅读辅助。', attr: { role: 'status', 'aria-live': 'polite' } });
+    const wordBar = bar.createDiv('era-word-actions');
+    this.linkButton = this.button(wordBar, '标为双链', () => this.linkSelection(), 'link');
+    this.linkButton.addEventListener('mousedown', e => e.preventDefault());
+    this.undoLinkButton = this.button(wordBar, '撤销标词', () => this.undoLink(), 'undo-2'); this.undoLinkButton.hidden = true;
     this.layout = this.contentEl.createDiv('era-layout');
     this.article = this.layout.createDiv('era-article markdown-rendered');
     this.article.setAttribute('tabindex', '0');
     this.article.setAttribute('aria-label', '文章正文'); this.article.setAttribute('aria-busy', 'true');
+    this.article.addEventListener('keydown', e => { if (e.key === 'Escape') this.clearSentence(); });
     const loading = this.article.createDiv({ cls: 'era-loading', text: '正在打开文章…' });
     this.syncLayers();
     this.article.addEventListener('click', event => {
@@ -253,7 +301,7 @@ class Reader extends ItemView {
       for (const mark of this.article.querySelectorAll('.era-mark')) mark.replaceWith(mark.ownerDocument.createTextNode(mark.textContent));
       this.article.normalize();
     }
-    const elements = [...this.article.querySelectorAll('p,li,h1,h2,h3,h4,h5,h6,td,th')].filter(el => !el.closest(SKIP) && !el.querySelector('p,li,table,pre') && /[a-zA-Z]/.test(el.textContent));
+    const elements = [...this.article.querySelectorAll('p,li,td,th')].filter(el => !el.closest(SKIP) && !el.querySelector('p,li,table,pre') && /[a-zA-Z]/.test(el.textContent));
     const texts = elements.map(el => textNodes(el).map(n => n.data).join(''));
     const key = hash(VERSION + JSON.stringify(texts));
     const cache = `${this.plugin.manifest.dir}/cache/${key}.json`;
@@ -275,7 +323,7 @@ class Reader extends ItemView {
     let sliceStart = performance.now();
     for (let i = 0; i < elements.length; i++) {
       if (generation !== this.generation || this.stale) return;
-      decorate(elements[i], result.blocks[i]);
+      decorate(elements[i], result.blocks[i], i);
       if (performance.now() - sliceStart > 8) { await yieldUI(); sliceStart = performance.now(); }
     }
     this.analysisReady = true; this.syncLayers();
@@ -295,6 +343,151 @@ class Reader extends ItemView {
     if (!d.question && d.quote && ['quote', 'before', 'after'].some(key => d[key] !== excerpt[key])) {
       this.switchDraft(this.parkedDrafts().find(item => !item.question && item.quote === quote && item.before === excerpt.before && item.after === excerpt.after) || excerpt);
     } else { Object.assign(d, excerpt); this.switchDraft(d); }
+  }
+  clearSentence() {
+    for (const mark of this.article.querySelectorAll('[data-detail]')) delete mark.dataset.detail;
+    this.sentenceButton?.setAttribute('aria-pressed', 'false');
+    this.syncLayers();
+  }
+  detailSentence() {
+    if (this.stale || !this.analysisReady) throw Error('请先分析当前文章。');
+    const selection = this.article.ownerDocument.getSelection();
+    const node = selection?.focusNode;
+    const mark = (node?.nodeType === 1 ? node : node?.parentElement)?.closest('.era-mark');
+    if (!mark || !this.article.contains(mark)) throw Error('请在要分析的句子中点一下或选词，再点「分析当前句」。');
+    const wasOpen = mark.dataset.detail;
+    this.clearSentence();
+    if (!wasOpen) {
+      for (const item of this.article.querySelectorAll(`[data-sentence="${mark.dataset.sentence}"]`)) item.dataset.detail = 'true';
+      this.layers.verbs = true; this.syncLayers();
+      this.sentenceButton.setAttribute('aria-pressed', 'true');
+      this.status('当前句显示完整语法 · 再点一次或按 Esc 返回主干阅读。');
+    }
+  }
+  selectedWord() {
+    const selection = this.article.ownerDocument.getSelection();
+    if (!selection?.rangeCount) throw Error('请先选中正文中的英文单词。');
+    const range = selection.getRangeAt(0);
+    if (!this.article.contains(range.startContainer) || !this.article.contains(range.endContainer)) throw Error('请在正文中选择单词。');
+    const quote = range.toString(); vocabTarget(quote);
+    const blocked = `${SKIP},a`;
+    if ([range.startContainer, range.endContainer].some(n => (n.nodeType === 1 ? n : n.parentElement)?.closest(blocked)) || range.cloneContents().querySelector(blocked)) throw Error('已有链接、代码、公式和嵌入内容不能重复标词。');
+    const prefix = range.cloneRange(); prefix.selectNodeContents(this.article); prefix.setEnd(range.startContainer, range.startOffset);
+    const start = prefix.toString().length, text = this.article.textContent;
+    if (/[a-z'-]/i.test(text[start - 1] || '') || /[a-z'-]/i.test(text[start + quote.length] || '')) throw Error('请选择完整单词。');
+    return { quote, start, end: start + quote.length, text };
+  }
+  async sourcePosition(selected, raw, file) {
+    const candidates = linkCandidates(raw, selected.quote, this.app.metadataCache.getFileCache(file));
+    if (!candidates.length) throw Error('这段选文无法安全映射到原文，请只选普通文本中的词。');
+    // ponytail: one native render per marking operation; cache a source map only
+    // if large-document measurements justify it. No second Markdown parser.
+    const key = randomUUID(), marker = (id, edge) => `\uE000${key}:${id}:${edge}\uE001`;
+    let probeRaw = '', previous = 0;
+    candidates.forEach((c, i) => { probeRaw += raw.slice(previous, c.start) + marker(i, 's') + selected.quote + marker(i, 'e'); previous = c.end; });
+    probeRaw += raw.slice(previous);
+    probeRaw = probeRaw.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/, '');
+    const probe = this.article.ownerDocument.createElement('div'), child = new Component(); child.load();
+    try {
+      await MarkdownRenderer.render(this.app, probeRaw, probe, file.path, child);
+      const text = probe.textContent, pattern = new RegExp(`\uE000${key}:(\\d+):([se])\uE001`, 'g'), positions = new Map();
+      let plain = '', last = 0;
+      for (const m of text.matchAll(pattern)) {
+        plain += text.slice(last, m.index); last = m.index + m[0].length;
+        const id = Number(m[1]), item = positions.get(id) || {};
+        if (item[m[2]] !== undefined) throw Error('选文存在重复渲染，未修改原文。');
+        item[m[2]] = plain.length; positions.set(id, item);
+      }
+      plain += text.slice(last);
+      if (plain !== selected.text) throw Error('这段 Markdown 的显示与原文映射不一致，未修改原文。');
+      const hits = [...positions].filter(([, p]) => p.s === selected.start && p.e === selected.end);
+      if (hits.length !== 1) throw Error('无法唯一确认选中位置，未修改原文。');
+      return candidates[hits[0][0]].start;
+    } finally { child.unload(); }
+  }
+  restoreSelection(start, end) {
+    const nodes = [], walker = this.article.ownerDocument.createTreeWalker(this.article, 4);
+    let offset = 0;
+    for (let n; (n = walker.nextNode());) { nodes.push({ n, start: offset, end: offset + n.length }); offset += n.length; }
+    const first = nodes.find(x => x.end > start), last = nodes.find(x => x.end >= end && x.start < end);
+    if (!first || !last) return;
+    const range = this.article.ownerDocument.createRange();
+    range.setStart(first.n, start - first.start); range.setEnd(last.n, end - last.start);
+    const selection = this.article.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+  }
+  async linkSelection() {
+    if (this.linkWriting || this.analysisTask) throw Error('正在更新阅读页，请稍后标词。');
+    if (this.stale) throw Error('原文已变化，请先刷新。');
+    const selected = this.selectedWord(), file = this.file, generation = this.generation, raw = this.sourceRaw;
+    this.linkWriting = true; this.status('正在标记…', 'busy');
+    try {
+      await this.plugin.readyFile(file);
+      const start = await this.sourcePosition(selected, raw, file);
+      const target = vocabTarget(selected.quote);
+      const existing = this.app.vault.getAbstractFileByPath(`Words/vocab/${target}.md`) || this.app.metadataCache.getFirstLinkpathDest(target, file.path);
+      const destination = existing instanceof TFile ? this.app.metadataCache.fileToLinktext(existing, file.path, true) : target;
+      if (/[\[\]|#^\r\n]/.test(destination)) throw Error('目标文件名无法安全生成双链，请在原文中处理。');
+      const inserted = `[[${destination}${destination === selected.quote ? '' : `|${selected.quote}`}]]`;
+      const after = applyLinkPatch(raw, this.sourceHash, start, selected.quote, inserted);
+      await this.app.vault.process(file, current => applyLinkPatch(current, hash(raw), start, selected.quote, inserted));
+      if (generation !== this.generation || this.file !== file) return;
+      if (await this.app.vault.read(file) !== after) { this.stale = true; throw Error('双链已写入，但原文随后又有改动，请刷新后继续。'); }
+      const scroll = this.article.scrollTop, anchors = [], walker = this.article.ownerDocument.createTreeWalker(this.article, 4), nodes = [];
+      let offset = 0;
+      for (let n; (n = walker.nextNode());) { nodes.push({ n, start: offset, end: offset + n.length }); offset += n.length; }
+      for (const item of nodes.filter(x => x.start < selected.end && x.end > selected.start)) {
+        let node = item.n;
+        const from = Math.max(0, selected.start - item.start), to = Math.min(node.length, selected.end - item.start);
+        if (to < node.length) node.splitText(to);
+        if (from) node = node.splitText(from);
+        const anchor = this.article.ownerDocument.createElement('a'); anchor.className = `internal-link${existing ? '' : ' is-unresolved'}`;
+        anchor.dataset.href = destination; anchor.setAttribute('href', destination); anchor.setAttribute('aria-label', destination);
+        node.replaceWith(anchor); anchor.append(node); anchors.push(anchor);
+      }
+      this.sourceRaw = after; this.sourceHash = hash(after); this.stale = false;
+      this.article.classList.toggle('era-colors', !!this.analysisReady);
+      this.linkHistory.push({ start, before: selected.quote, inserted, afterHash: hash(after), anchors, selection: selected });
+      this.undoLinkButton.hidden = false; this.restoreSelection(selected.start, selected.end); this.article.scrollTop = scroll;
+      this.status(`已标为双链：${selected.quote} · 可撤销，继续阅读。`);
+    } finally { this.linkWriting = false; }
+  }
+  async undoLink() {
+    const item = this.linkHistory.at(-1);
+    if (!item || this.linkWriting) return;
+    if (this.stale) throw Error('原文已变化，为避免覆盖新内容，本次不撤销。');
+    const file = this.file, generation = this.generation;
+    this.linkWriting = true;
+    try {
+      await this.plugin.readyFile(file);
+      const after = applyLinkPatch(this.sourceRaw, item.afterHash, item.start, item.inserted, item.before);
+      await this.app.vault.process(file, raw => applyLinkPatch(raw, item.afterHash, item.start, item.inserted, item.before));
+      if (generation !== this.generation || this.file !== file) return;
+      if (await this.app.vault.read(file) !== after) { this.stale = true; throw Error('已撤销，但原文随后又有改动，请刷新。'); }
+      const scroll = this.article.scrollTop;
+      for (const anchor of item.anchors) if (anchor.isConnected) anchor.replaceWith(...anchor.childNodes);
+      this.sourceRaw = after; this.sourceHash = hash(after); this.stale = false;
+      this.article.classList.toggle('era-colors', !!this.analysisReady);
+      this.linkHistory.pop(); this.undoLinkButton.hidden = !this.linkHistory.length;
+      this.restoreSelection(item.selection.start, item.selection.end); this.article.scrollTop = scroll;
+      this.status('已撤销上次标词。');
+    } finally { this.linkWriting = false; }
+  }
+  readingGoal() { return this.plugin.data.goals?.[this.file.path] || ''; }
+  showGoal() {
+    const q = this.readingGoal();
+    this.goalSummary.textContent = q ? `当前问题 · ${q}` : '阅读目标 · 可选，写下自己想弄懂的问题';
+    this.goalInput.value = q;
+  }
+  setGoal(text) {
+    (this.plugin.data.goals ||= {})[this.file.path] = text.trim().slice(0, 500);
+    this.showGoal(); this.goal.open = false; this.plugin.scheduleFlush();
+  }
+  answerQuestion(question) {
+    this.setGoal(question);
+    const d = this.draft(), next = d.question === question ? d : this.parkedDrafts().find(item => item.question === question);
+    if (next) this.switchDraft(next);
+    else if (!d.question && !d.text.trim()) { d.question = question; this.switchDraft(d); }
+    else this.switchDraft({ question });
   }
   async saveNote() {
     if (this.saving) return;
@@ -361,7 +554,7 @@ class Reader extends ItemView {
         { text: 'Which evidence or examples support it, and how?', el: headings[1] || headings[0] },
         { text: 'What remains unclear, and how does this connect to what you already know?', el: headings.at(-1) }
       ];
-      this.questionsPanel.createEl('p', { cls: 'era-muted', text: found.length ? '从正文提取的问题。' : '规则模板导读题，帮助梳理思路；不是 AI 深度提问。' });
+      this.questionsPanel.createEl('p', { cls: 'era-muted', text: found.length ? '从正文提取的问题。' : '规则模板导读题 · 可选提示，也可以自己提问。' });
     } else this.questionsPanel.createEl('p', { cls: 'era-muted', text: '原书问题 · Focus Questions' });
     this.questionsTab.querySelector('.era-button-label').textContent = `问题 ${questions.length}`;
     for (const [index, q] of questions.entries()) {
@@ -379,13 +572,8 @@ class Reader extends ItemView {
           else return this.app.workspace.openLinkText(`${this.file.path}#^${q.target}`, this.file.path, true);
         }
       }, 'locate');
-      this.button(actions, '写回答', () => {
-        const d = this.draft();
-        const next = d.question === q.text ? d : this.parkedDrafts().find(item => item.question === q.text);
-        if (next) this.switchDraft(next);
-        else if (!d.question && !d.text.trim()) { d.question = q.text; this.switchDraft(d); }
-        else this.switchDraft({ question: q.text });
-      }, 'pen-line');
+      this.button(actions, '设为目标', () => this.setGoal(q.text), 'flag');
+      this.button(actions, '写回答', () => this.answerQuestion(q.text), 'pen-line');
     }
   }
 }
@@ -403,6 +591,14 @@ class ReadingPlugin extends Plugin {
     this.pythonPath = runtime.pythonPath || path.join(this.app.vault.adapter.getBasePath(), this.manifest.dir, '.runtime', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
     this.registerView(TYPE, leaf => new Reader(leaf, this));
     this.addCommand({ id: 'open-current', name: '为当前文章打开阅读助手', callback: () => this.open().catch(e => new Notice(e.message)) });
+    for (const [id, name, method] of [['link-selection', '将阅读页选词标为双链', 'linkSelection'], ['undo-link', '撤销阅读页上次标词', 'undoLink'], ['detail-sentence', '分析阅读页当前句', 'detailSentence']]) {
+      this.addCommand({ id, name, checkCallback: checking => {
+        const view = this.app.workspace.activeLeaf?.view;
+        if (!(view instanceof Reader)) return false;
+        if (!checking) Promise.resolve().then(() => view[method]()).catch(e => { view.status(e.message, 'error'); new Notice(e.message); });
+        return true;
+      } });
+    }
     this.addRibbonIcon('book-open-text', '为当前文章打开阅读助手', () => this.open().catch(e => new Notice(e.message)));
     this.registerEvent(this.app.vault.on('modify', file => {
       for (const leaf of this.app.workspace.getLeavesOfType(TYPE)) if (leaf.view.file?.path === file.path) {
@@ -413,6 +609,7 @@ class ReadingPlugin extends Plugin {
       if (this.data.drafts[old]) { this.data.drafts[file.path] = this.data.drafts[old]; delete this.data.drafts[old]; }
       if (this.data.parkedDrafts?.[old]) { this.data.parkedDrafts[file.path] = this.data.parkedDrafts[old]; delete this.data.parkedDrafts[old]; }
       if (this.data.notes[old]) { this.data.notes[file.path] = this.data.notes[old]; delete this.data.notes[old]; }
+      if (this.data.goals?.[old]) { this.data.goals[file.path] = this.data.goals[old]; delete this.data.goals[old]; }
       for (const q of this.questions) if (q.file === old) q.file = file.path;
       this.flush().catch(e => new Notice(e.message));
     }));
@@ -480,4 +677,4 @@ class ReadingPlugin extends Plugin {
   onunload() { this.app.workspace.detachLeavesOfType(TYPE); this.flush().catch(e => console.error('阅读助手草稿保存失败', e)); }
 }
 module.exports = ReadingPlugin;
-module.exports.checks = { valid, locate, hash };
+module.exports.checks = { valid, locate, hash, vocabTarget, linkCandidates, applyLinkPatch };

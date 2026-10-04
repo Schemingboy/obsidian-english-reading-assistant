@@ -29,3 +29,19 @@ for (text, expected), block in zip(samples, result['blocks']):
             previous = span['end']
     assert ''.join(g['text'] for g in block['groups']) == text
 print(json.dumps({'grammar_samples': len(samples), 'offsets': 'UTF-16 checked including emoji', 'status': 'passed'}))
+
+segmentation = [
+    ('A plan that looks simple may fail when the conditions change.', ['A plan that looks simple', 'may fail', 'when the conditions change.']),
+    ('To understand how people learn, we need to consider what they already know.', ['To understand how people learn,', 'we need to consider', 'what they already know.']),
+    ('The key to understanding the argument is to identify what the author assumes.', ['The key to understanding the argument', 'is to identify', 'what the author assumes.']),
+    ('After reading the report, she decided to ask two questions.', ['After reading the report,', 'she decided to ask two questions.']),
+    ('He has not been able to finish the work.', ['He has not been able to finish the work.']),
+    ('She has read and written all day. He turned off the light.', ['She has read and written all day.', 'He turned off the light.']),
+]
+results = analyze(spacy.load('en_core_web_sm', disable=['ner']), [text for text, _ in segmentation])
+for (text, expected), block in zip(segmentation, results['blocks']):
+    assert [g['text'].strip() for g in block['groups']] == expected, (text, block['groups'])
+    assert ''.join(g['text'] for g in block['groups']) == text
+    for sentence in block['sentences']:
+        assert text[sentence['start']:sentence['end']] == sentence['text']
+print(json.dumps({'segmentation_regressions': len(segmentation), 'status': 'passed'}))
