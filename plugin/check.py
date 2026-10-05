@@ -14,12 +14,21 @@ samples = [
     ('They will not have finished when we arrive.', {'will': 'main', 'not': 'main', 'have': 'main', 'finished': 'main', 'arrive': 'subordinate'}),
     ('😀 She said that he was tired.', {'said': 'main', 'was': 'subordinate'}),
     ('Reading books helps us learn.', {'Reading': 'nonfinite', 'helps': 'main', 'learn': 'nonfinite'}),
+    ('They found that mixing sand and water produced mud.', {'found': 'main', 'mixing': 'nonfinite', 'produced': 'subordinate'}),
+    ('Mixing sand and water produced mud.', {'Mixing': 'nonfinite', 'produced': 'main'}),
+    ('They\u00a0found that mixing sand\u202fand water produced mud.', {'found': 'main', 'mixing': 'nonfinite', 'produced': 'subordinate'}),
+    ('Its use has led researchers to call the period a new age; thereafter, the tool was increasingly replaced by machines.', {'has': 'main', 'led': 'main', 'to': 'nonfinite', 'call': 'nonfinite', 'was': 'main', 'replaced': 'main'}),
+    ('She said that he worked; later, he rested.', {'said': 'main', 'worked': 'subordinate', 'rested': 'main'}),
+    ('They recommended mixing sand and heated water.', {'recommended': 'main', 'mixing': 'nonfinite'}),
+    ('Mixing sand and heated water requires care.', {'Mixing': 'nonfinite', 'requires': 'main'}),
 ]
 result = analyze(spacy.load('en_core_web_sm', disable=['ner']), [s[0] for s in samples])
 for (text, expected), block in zip(samples, result['blocks']):
     actual = {p['text']: p['role'] for p in block['predicates']}
     for token, role in expected.items():
         assert actual.get(token) == role, (text, token, role, actual)
+    if 'heated water' in text:
+        assert actual.get('heated') not in ('main', 'subordinate'), actual
     utf16 = text.encode('utf-16-le')
     for kind in ['groups', 'predicates']:
         previous = 0

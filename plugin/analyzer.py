@@ -3,7 +3,7 @@ import json
 import sys
 from spacy.language import Language
 
-VERSION = "spacy-en-sm-3.8.0-r4"
+VERSION = "spacy-en-sm-3.8.0-r5"
 COMPACT_WORDS = 8
 MIN_MODIFIER_WORDS = 3
 ERA_ABBREVIATIONS = {"B.C.", "A.D.", "B.C.E.", "C.E."}
@@ -149,12 +149,38 @@ def reading_cuts(doc, chains):
     return sorted(normalized)
 
 
+def recovered_finite_roles(doc):
+    """Repair an orphan gerund subject whose past-tense verb was tagged VBN.
+
+    The small model can attach the final coordinated noun as npadvmod of the
+    following participle. Only recover a unique candidate in a clause with no
+    finite verb; ordinary noun modifiers and auxiliary chains stay untouched.
+    """
+    recovered = {}
+    for head in doc:
+        if head.tag_ != "VBG" or head.dep_ not in ("ROOT", "ccomp"):
+            continue
+        parts = list(head.subtree)
+        if any("Fin" in t.morph.get("VerbForm") or t.tag_ == "MD" for t in parts):
+            continue
+        if any(c.dep_ in ("aux", "auxpass") for c in head.children):
+            continue
+        candidates = [t for t in parts if t.i > head.i and t.tag_ == "VBN"
+                      and any(c.dep_ == "npadvmod" and head.i < c.i < t.i for c in t.children)
+                      and not any(c.dep_ in ("aux", "auxpass") for c in t.children)]
+        if len(candidates) == 1:
+            recovered[candidates[0].i] = "main" if head.dep_ == "ROOT" else "subordinate"
+    return recovered
+
+
 def analyze(nlp, texts):
     if "reading_era_sentences" not in nlp.pipe_names:
         nlp.add_pipe("reading_era_sentences", before="parser")
     results = []
-    for doc in nlp.pipe(texts, batch_size=16):
-        text = doc.text
+    # Web typography spaces confuse the tagger. One-character replacements
+    # preserve offsets; all returned spans still slice the original text.
+    normalized = (t.replace("\u00a0", " ").replace("\u202f", " ") for t in texts)
+    for text, doc in zip(texts, nlp.pipe(normalized, batch_size=16)):
         offsets = [0]
         for char in text:
             offsets.append(offsets[-1] + (2 if ord(char) > 0xFFFF else 1))
@@ -164,6 +190,7 @@ def analyze(nlp, texts):
 
         verbs = []
         chains = []
+        recovered = recovered_finite_roles(doc)
         for token in doc:
             if token.pos_ not in ("VERB", "AUX") or token.dep_ in ("aux", "auxpass"):
                 continue
@@ -183,6 +210,15 @@ def analyze(nlp, texts):
             while head.dep_ == "conj":
                 head = head.head
             role = ("main" if head.dep_ == "ROOT" else "subordinate") if finite else "nonfinite"
+            # A leading independent clause may be attached across a semicolon
+            # as ccomp of the following clause. Require its own subject and no
+            # subordinating marker, and do not promote embedded complements.
+            if finite and head.dep_ == "ccomp" and head.left_edge.i == head.sent.start:
+                children = list(head.children)
+                if any(c.dep_ in ("nsubj", "nsubjpass", "csubj") for c in children) and not any(c.dep_ == "mark" for c in children):
+                    if head.i < head.head.i and any(t.text == ";" for t in doc[head.i:head.head.i]):
+                        role = "main"
+            role = recovered.get(token.i, role)
             explanation = " ".join(t.text for t in chain)
             chains.append((chain[0].idx, chain[-1].idx + len(chain[-1])))
             for part in chain:

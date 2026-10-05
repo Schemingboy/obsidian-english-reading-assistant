@@ -1,9 +1,9 @@
 // Run: node check.js. Uses the actual plugin helpers with only Obsidian's host classes stubbed.
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const sandbox = { module: { exports: {} }, process, Buffer, require: name => name === 'obsidian' ? { Plugin: class {
-  registerView() {} addCommand() {} addRibbonIcon() {} registerEvent() {}
+  registerView() {} addCommand() {} addRibbonIcon() {} registerEvent() {} addSettingTab() {}
   registerHoverLinkSource(id, options) { this.hoverSource = { id, options }; }
-}, ItemView: class {} } : require(name) };
+}, FileView: class {}, PluginSettingTab: class {} } : name === 'module' ? { createRequire: () => require } : require(name) };
 vm.runInNewContext(fs.readFileSync(__dirname + '/main.js', 'utf8'), sandbox);
 const { valid, locate, hash, vocabTarget, linkCandidates, applyLinkPatch } = sandbox.module.exports.checks;
 const { noteEntries, updatedEntry, replaceEntry } = sandbox.module.exports.checks;
@@ -11,8 +11,9 @@ assert.equal(locate('same same', 'same'), -1);
 assert.equal(locate('one same two same end', 'same', 'two ', ' end'), 13);
 assert.equal(locate('changed', 'old'), -1);
 assert.equal(locate('a unique sentence', 'unique'), 2);
-const good = { version: 'spacy-en-sm-3.8.0-r4', blocks: [{ groups: [{ start: 0, end: 5, text: 'hello' }], predicates: [], sentences: [{ start: 0, end: 5, text: 'hello' }] }] };
+const good = { version: 'spacy-en-sm-3.8.0-r5', blocks: [{ groups: [{ start: 0, end: 5, text: 'hello' }], predicates: [], sentences: [{ start: 0, end: 5, text: 'hello' }] }] };
 assert(!valid({ ...good, version: 'spacy-en-sm-3.8.0-r3' }, ['hello']));
+assert(!valid({ ...good, version: 'spacy-en-sm-3.8.0-r4' }, ['hello']));
 assert(valid(good, ['hello']));
 assert(!valid(good, ['world']));
 good.blocks[0].groups[0].end = 50;
@@ -38,7 +39,7 @@ console.log('PASS: safe vocabulary target, frontmatter/link exclusions, exact oc
   const plugin = new sandbox.module.exports();
   plugin.manifest = { dir: '.obsidian/plugins/english-reading-assistant' };
   const reads = [];
-  plugin.app = { vault: { on() {}, adapter: { exists: async () => false, read: async path => { reads.push(path); throw Error('Unexpected read'); }, getBasePath: () => '/test-vault' } } };
+  plugin.app = { workspace: { on() {}, getLeavesOfType() { return []; } }, metadataCache: { on() {} }, vault: { on() {}, adapter: { exists: async () => false, read: async path => { reads.push(path); throw Error('Unexpected read'); }, getBasePath: () => '/test-vault' } } };
   await plugin.onload();
   assert.equal(plugin.hoverSource.id, 'english-reading-assistant');
   assert.equal(plugin.hoverSource.options.defaultMod, true);

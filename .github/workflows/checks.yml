@@ -14,6 +14,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: node plugin/check.js
+      - run: node plugin/check-agent.js
       - run: python plugin/check-colors.py
       - run: python scripts/check-sync.py
       - run: python -m py_compile plugin/analyzer.py scripts/sync.py

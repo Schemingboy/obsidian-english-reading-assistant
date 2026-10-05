@@ -11,8 +11,8 @@ import subprocess
 from datetime import datetime
 
 ROOT = Path(__file__).resolve().parents[1]
-CODE = ['main.js', 'styles.css', 'manifest.json', 'analyzer.py']
-MIRROR = CODE + ['requirements.txt', 'check.js', 'check.py', 'check-colors.py']
+CODE = ['main.js', 'agent.js', 'agent-ui.js', 'agent-reading.js', 'styles.css', 'manifest.json', 'analyzer.py']
+MIRROR = CODE + ['requirements.txt', 'check.js', 'check-agent.js', 'check.py', 'check-colors.py']
 
 
 def digest(content):

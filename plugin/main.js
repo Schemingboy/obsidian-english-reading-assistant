@@ -1,10 +1,11 @@
-const { Plugin, ItemView, MarkdownRenderer, Component, Notice, TFile, Scope, Keymap, setIcon } = require('obsidian');
+const { Plugin, FileView, MarkdownRenderer, Component, Notice, TFile, Scope, Keymap, setIcon, PluginSettingTab, Setting } = require('obsidian');
+let Agent;
 const { spawn } = require('child_process');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
 const { setImmediate } = require('timers');
 const TYPE = 'english-reading-assistant';
-const VERSION = 'spacy-en-sm-3.8.0-r4';
+const VERSION = 'spacy-en-sm-3.8.0-r5';
 const hash = text => createHash('sha256').update(text).digest('hex');
 const today = () => new Date().toLocaleDateString('sv-SE');
 const roles = { main: '主句谓语', subordinate: '从句谓语', nonfinite: '非谓语动词' };
@@ -145,9 +146,9 @@ function decorate(el, block, blockId) {
   }
 }
 
-class Reader extends ItemView {
+class Reader extends FileView {
   constructor(leaf, plugin) {
-    super(leaf); this.plugin = plugin; this.generation = 0; this.layers = { groups: true, verbs: true }; this.grammarMode = 'backbone'; this.linkHistory = []; this.panel = 'notes';
+    super(leaf); this.plugin = plugin; this.generation = 0; this.layers = { groups: true, verbs: true, nonfinite: false }; this.linkHistory = []; this.panel = 'notes';
     this.scope = new Scope(this.app.scope);
     this.scope.register(['Mod'], 'f', () => { this.openSearch(); return false; });
   }
@@ -155,13 +156,40 @@ class Reader extends ItemView {
   getDisplayText() { return this.file ? `阅读 · ${this.file.basename}` : '英文阅读助手'; }
   getIcon() { return 'book-open-text'; }
   getState() { return { file: this.file?.path }; }
-  async setState(state, result) {
-    const file = this.app.vault.getAbstractFileByPath(state.file);
-    if (file instanceof TFile) { this.file = file; await this.render(); }
-    await super.setState(state, result);
+  canAcceptExtension(extension) { return extension === 'md'; }
+  async onLoadFile() { await this.render(); }
+  async onUnloadFile() { this.cancelAgent(); this.generation++; clearTimeout(this.previewTimer); this.previewGeneration = (this.previewGeneration || 0) + 1; this.worker?.kill(); await this.plugin.flush(); }
+  getMode() { return 'preview'; }
+  get scroll() {
+    let line = 0;
+    const top = this.article?.getBoundingClientRect().top || 0;
+    for (const { heading, el } of this.outlineHeadings || []) {
+      if (el.getBoundingClientRect().top <= top + 45) line = heading.position.end.line;
+    }
+    return line;
+  }
+  setEphemeralState(state) {
+    if (!Number.isInteger(state?.line)) return;
+    if (this.stale) { this.status('原文已变化，请刷新阅读页后定位标题。', 'error'); return; }
+    const headings = this.outlineHeadings || [];
+    const target = headings.find(x => x.heading.position.start.line === state.line)
+      || [...headings].reverse().find(x => x.heading.position.start.line <= state.line);
+    if (target) { target.el.scrollIntoView({ block: 'start' }); this.app.workspace.trigger('markdown-scroll', this); }
+  }
+  mapOutlineHeadings() {
+    const cached = this.app.metadataCache.getFileCache(this.file)?.headings || [];
+    const elements = [...this.article.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(el => !el.closest('.internal-embed'));
+    // Preserve order to disambiguate repeated heading titles; rendered markup
+    // may differ from the raw heading, so compare level and native data-heading.
+    this.outlineHeadings = []; let cursor = 0;
+    for (const heading of cached) {
+      const index = elements.findIndex((el, i) => i >= cursor && Number(el.tagName.slice(1)) === heading.level
+        && (el.dataset.heading === heading.heading || el.textContent.trim() === heading.heading));
+      if (index >= 0) { this.outlineHeadings.push({ heading, el: elements[index] }); cursor = index + 1; }
+    }
   }
   async onOpen() { this.contentEl.addClass('era-view'); }
-  async onClose() { this.generation++; if (this.article) this.clearSearchHighlight(); this.child?.unload(); this.worker?.kill(); await this.plugin.flush(); }
+  async onClose() { this.cancelAgent(); this.generation++; clearTimeout(this.previewTimer); this.previewGeneration = (this.previewGeneration || 0) + 1; if (this.article) this.clearSearchHighlight(); this.child?.unload(); this.worker?.kill(); await this.plugin.flush(); }
   draft() { return this.plugin.data.drafts[this.file.path] ||= { text: '', quote: '', before: '', after: '', question: '' }; }
   parkedDrafts() { return (this.plugin.data.parkedDrafts ||= {})[this.file.path] ||= []; }
   switchDraft(next) {
@@ -169,7 +197,7 @@ class Reader extends ItemView {
     if (next !== current) {
       const index = parked.indexOf(next);
       if (index >= 0) parked.splice(index, 1);
-      if (current.text.trim()) parked.push(current);
+      if (current.text.trim() || current.question || excerpts(current).length || current.edit) parked.push(current);
       this.plugin.data.drafts[this.file.path] = index >= 0 ? next : { text: '', quote: '', before: '', after: '', question: '', ...next };
     }
     this.showDraft(); this.selectPanel('notes'); this.editor.focus(); this.plugin.scheduleFlush();
@@ -190,7 +218,7 @@ class Reader extends ItemView {
     });
     this.questionEl.textContent = d.question; this.questionEl.hidden = !d.question;
     this.clearQuoteButton.hidden = !items.length; this.clearQuestionButton.hidden = !d.question;
-    if (this.preview) { this.preview.hidden = true; this.editor.hidden = false; this.previewButton?.setAttribute('aria-pressed', 'false'); }
+    if (this.preview) { this.preview.hidden = !this.previewEnabled; this.editor.hidden = false; this.previewButton?.setAttribute('aria-pressed', String(!!this.previewEnabled)); this.scheduleNotePreview(); }
     this.draftSelect.empty();
     const parked = this.parkedDrafts();
     this.draftSelect.createEl('option', { text: `暂存草稿（${parked.length}）`, value: '' });
@@ -208,28 +236,33 @@ class Reader extends ItemView {
         const result = action();
         if (result?.then) { button.disabled = true; button.setAttribute('aria-busy', 'true'); await result; }
       } catch (e) { this.status(e.message, 'error'); new Notice(e.message); }
-      finally { button.disabled = button === this.undoLinkButton && !this.linkHistory.length; button.removeAttribute('aria-busy'); }
+      finally {
+        button.disabled = button === this.undoLinkButton && !this.linkHistory.length; button.removeAttribute('aria-busy');
+        if ([this.agentSend, this.agentCopy, this.agentAppend, this.agentRevise].includes(button)) this.updateAgentUI();
+      }
     });
     return button;
   }
   selectPanel(name) {
     this.panel = name;
-    for (const key of ['notes', 'questions']) {
+    for (const key of ['notes', 'questions', 'agent']) {
       this[`${key}Panel`].hidden = name !== key;
       this[`${key}Tab`].setAttribute('aria-selected', String(name === key));
       this[`${key}Tab`].tabIndex = name === key ? 0 : -1;
     }
     this.layout.classList.remove('era-focus'); this.focusButton.setAttribute('aria-pressed', 'false');
+    if (name === 'agent') { this.updateAgentUI(); if (!this.agentController) this.refreshAgentContext(); }
   }
   syncLayers() {
-    for (const key of ['groups', 'verbs']) {
+    for (const key of ['groups', 'verbs', 'nonfinite']) {
       this.article.classList.toggle(`era-${key}`, this.layers[key]);
       this[`${key}Button`].setAttribute('aria-pressed', String(this.layers[key]));
       this[`${key}Button`].disabled = !this.analysisReady;
     }
-    this.article.classList.toggle('era-backbone', this.grammarMode === 'backbone');
-    if (this.legend) this.legend.classList.toggle('era-backbone', this.grammarMode === 'backbone' && !this.article.querySelector('[data-detail]'));
-    if (this.grammarSelect) this.grammarSelect.disabled = !this.analysisReady || !this.layers.verbs;
+    const detail = !!this.article.querySelector('[data-detail]');
+    for (const label of this.legend?.querySelectorAll('[data-role]') || []) {
+      label.hidden = !detail && !(label.dataset.role === 'nonfinite' ? this.layers.nonfinite : this.layers.verbs);
+    }
     if (this.sentenceButton) this.sentenceButton.disabled = !this.analysisReady;
   }
   async render() {
@@ -240,10 +273,14 @@ class Reader extends ItemView {
       this.stale = false; this.article.classList.toggle('era-colors', !!this.analysisReady); this.status('已是最新内容'); return;
     }
     const generation = ++this.generation;
+    clearTimeout(this.previewTimer); this.previewGeneration = (this.previewGeneration || 0) + 1;
+    this.cancelAgent();
+    if (this.renderedPath !== this.file.path) this.agentState = null;
     this.worker?.kill(); this.worker = null; this.analysisTask = null; this.analysisReady = false;
     if (this.article) this.clearSearchHighlight();
     this.searchHighlightStyle = null;
-    this.contentEl.empty(); this.contentEl.classList.remove('era-reading-started'); this.child?.unload(); this.child = new Component(); this.child.load();
+    this.contentEl.empty(); this.contentEl.classList.remove('era-reading-started'); this.child?.unload(); this.previewChild = null; this.child = new Component(); this.child.load();
+    this.agentStatus = null;
     this.lastWordRange = null; this.bracket = null;
     if (generation !== this.generation) return;
     this.sourceHash = hash(raw); this.sourceRaw = raw; this.stale = false; this.linkHistory = [];
@@ -261,13 +298,9 @@ class Reader extends ItemView {
     const bar = this.contentEl.createDiv('era-toolbar');
     this.analyzeButton = this.button(bar, '分析文章', () => this.analyze(), 'scan-text'); this.analyzeButton.addClass('era-primary');
     const toggles = bar.createDiv({ cls: 'era-layers', attr: { role: 'group', 'aria-label': '阅读辅助显示' } });
-    for (const [key, label, icon] of [['groups', '意群', 'align-left'], ['verbs', '谓语与非谓语', 'baseline']]) {
+    for (const [key, label, icon] of [['groups', '意群', 'align-left'], ['verbs', '谓语', 'baseline'], ['nonfinite', '显示非谓语', 'italic']]) {
       this[`${key}Button`] = this.button(toggles, label, () => { this.layers[key] = !this.layers[key]; this.syncLayers(); }, icon);
     }
-    this.grammarSelect = toggles.createEl('select', { cls: 'era-grammar-select', attr: { 'aria-label': '语法提示层次' } });
-    for (const [value, text] of [['backbone', '阅读主干'], ['full', '完整分析']]) this.grammarSelect.createEl('option', { value, text });
-    this.grammarSelect.value = this.grammarMode;
-    this.grammarSelect.addEventListener('change', () => { this.grammarMode = this.grammarSelect.value; this.syncLayers(); });
     this.sentenceButton = this.button(bar, '分析当前句', () => this.detailSentence(), 'text-cursor-input');
     this.sentenceButton.addEventListener('mousedown', e => e.preventDefault());
     this.sentenceButton.addEventListener('keydown', e => { if (e.key === 'Escape') this.clearSentence(); });
@@ -307,7 +340,7 @@ class Reader extends ItemView {
     this.article.setAttribute('tabindex', '0');
     this.article.setAttribute('aria-label', '文章正文'); this.article.setAttribute('aria-busy', 'true');
     this.article.addEventListener('keydown', e => { if (e.key === 'Escape') this.clearSentence(); });
-    this.article.addEventListener('scroll', () => { if (this.article.scrollTop > 20) this.contentEl.classList.add('era-reading-started'); }, { passive: true });
+    this.article.addEventListener('scroll', () => { if (this.article.scrollTop > 20) this.contentEl.classList.add('era-reading-started'); this.app.workspace.trigger('markdown-scroll', this); }, { passive: true });
     const doc = this.article.ownerDocument;
     this.child.registerDomEvent(doc, 'selectionchange', () => {
       const s = doc.getSelection();
@@ -341,10 +374,10 @@ class Reader extends ItemView {
     this.child.registerDomEvent(this.article, 'auxclick', openLink, true);
     this.side = this.layout.createDiv('era-side');
     const tabs = this.side.createDiv({ cls: 'era-tabs', attr: { role: 'tablist', 'aria-label': '阅读笔记' } });
-    for (const [key, label] of [['notes', '手札'], ['questions', '问题']]) {
+    for (const [key, label] of [['notes', '手札'], ['questions', '问题'], ['agent', 'Agent']]) {
       const tab = this[`${key}Tab`] = this.button(tabs, label, () => this.selectPanel(key));
       tab.setAttribute('role', 'tab'); tab.id = `era-${this.leaf.id}-${key}-tab`; tab.setAttribute('aria-controls', `era-${this.leaf.id}-${key}`);
-      tab.addEventListener('keydown', e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) { e.preventDefault(); const next = e.key === 'Home' ? 'notes' : e.key === 'End' ? 'questions' : key === 'notes' ? 'questions' : 'notes'; this.selectPanel(next); this[`${next}Tab`].focus(); } });
+      tab.addEventListener('keydown', e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) { e.preventDefault(); const keys = ['notes', 'questions', 'agent']; const next = e.key === 'Home' ? keys[0] : e.key === 'End' ? keys[2] : keys[(keys.indexOf(key) + (e.key === 'ArrowRight' ? 1 : 2)) % 3]; this.selectPanel(next); this[`${next}Tab`].focus(); } });
       this[`${key}Panel`] = this.side.createDiv({ cls: `era-panel era-${key}-panel`, attr: { role: 'tabpanel', id: `era-${this.leaf.id}-${key}`, 'aria-labelledby': tab.id } });
     }
     this.selectPanel(this.panel);
@@ -357,13 +390,16 @@ class Reader extends ItemView {
     this.questionEl = this.notesPanel.createDiv({ cls: 'era-question-label', text: this.draft().question }); this.questionEl.hidden = !this.draft().question;
     this.editor = this.notesPanel.createEl('textarea', { attr: { placeholder: '自己的理解、一个疑问，\n或这道题的答案…', 'aria-label': '手札或问题回答' } });
     this.editor.value = this.draft().text;
-    this.editor.addEventListener('input', () => { this.draft().text = this.editor.value; this.plugin.scheduleFlush(); });
+    this.editor.addEventListener('input', () => { this.draft().text = this.editor.value; this.plugin.scheduleFlush(); this.scheduleNotePreview(); });
     this.editor.addEventListener('keydown', e => this.markdownKey(e));
     this.preview = this.notesPanel.createDiv('era-note-preview markdown-rendered'); this.preview.hidden = true;
     const noteActions = this.notesPanel.createDiv('era-note-actions');
     this.saveNoteButton = this.button(noteActions, '保存手札', () => this.saveNote(), 'check'); this.saveNoteButton.addClass('era-primary');
     this.button(noteActions, '打开笔记', () => this.openNotes(), 'external-link');
-    this.previewButton = this.button(noteActions, 'Markdown 预览', () => this.togglePreview(), 'eye');
+    this.previewButton = this.button(noteActions, '实时预览', () => this.togglePreview(), 'eye');
+    this.button(noteActions, 'Agent 检查回答', () => this.openAgent('review'), 'message-circle');
+    this.agentUndoButton = this.button(noteActions, '撤回 Agent 修改', () => this.undoAgentEdit(), 'undo-2');
+    this.agentUndoButton.hidden = !this.plugin.data.agentUndo?.[this.file.path];
     const draftActions = this.notesPanel.createDiv('era-draft-actions');
     this.exitEditingButton = this.button(draftActions, '暂存并退出编辑', () => this.switchDraft({}), 'corner-up-left'); this.exitEditingButton.hidden = true;
     this.button(draftActions, '新手札', () => this.switchDraft({}), 'plus');
@@ -372,6 +408,7 @@ class Reader extends ItemView {
     this.draftSelect = this.notesPanel.createEl('select', { cls: 'era-draft-select', attr: { 'aria-label': '恢复暂存草稿' } });
     this.draftSelect.addEventListener('change', () => { if (this.draftSelect.value !== '') this.switchDraft(this.parkedDrafts()[Number(this.draftSelect.value)]); });
     this.showDraft();
+    this.buildAgentPanel();
     this.saved = this.notesPanel.createDiv('era-saved');
     this.questionsPanel.createDiv({ cls: 'era-muted', text: '正在整理本文问题…' });
     await yieldUI();
@@ -381,6 +418,7 @@ class Reader extends ItemView {
     separateHeadings(content);
     if (generation !== this.generation) return;
     loading.replaceWith(content); this.article.removeAttribute('aria-busy');
+    this.mapOutlineHeadings();
     const blocks = this.app.metadataCache.getFileCache(this.file)?.blocks || {};
     for (const heading of this.article.querySelectorAll('[data-heading]')) {
       const id = heading.dataset.heading.match(/\^([\w-]+)\s*$/)?.[1];
@@ -388,6 +426,7 @@ class Reader extends ItemView {
     }
     await this.showSaved();
     await this.showQuestions();
+    this.refreshAgentContext();
   }
   analyze() {
     if (this.analysisTask) return this.analysisTask;
@@ -497,14 +536,30 @@ class Reader extends ItemView {
     const token = e.key.toLowerCase() === 'b' ? '**' : '*', start = this.editor.selectionStart, end = this.editor.selectionEnd;
     this.editor.setRangeText(token + this.editor.value.slice(start, end) + token, start, end, 'select');
     this.editor.setSelectionRange(start + token.length, end + token.length);
-    this.draft().text = this.editor.value; this.plugin.scheduleFlush();
+    this.draft().text = this.editor.value; this.plugin.scheduleFlush(); this.scheduleNotePreview();
   }
   async togglePreview() {
-    if (!this.preview.hidden) { this.preview.hidden = true; this.editor.hidden = false; this.previewButton.setAttribute('aria-pressed', 'false'); this.editor.focus({ preventScroll: true }); return; }
-    this.preview.empty();
-    this.previewChild?.unload(); this.previewChild = new Component(); this.child.addChild(this.previewChild);
-    await MarkdownRenderer.render(this.app, this.draft().text || '*还没有写下内容。*', this.preview, this.plugin.notePath(this.file.path), this.previewChild);
-    this.preview.hidden = false; this.editor.hidden = true; this.previewButton.setAttribute('aria-pressed', 'true');
+    this.previewEnabled = !this.previewEnabled; this.preview.hidden = !this.previewEnabled;
+    this.previewButton.setAttribute('aria-pressed', String(this.previewEnabled));
+    clearTimeout(this.previewTimer); this.previewGeneration = (this.previewGeneration || 0) + 1;
+    if (this.previewEnabled) await this.renderNotePreview(this.previewGeneration);
+    else { if (this.previewChild) this.child.removeChild(this.previewChild); this.previewChild = null; }
+  }
+  scheduleNotePreview() {
+    clearTimeout(this.previewTimer); const version = this.previewGeneration = (this.previewGeneration || 0) + 1;
+    if (!this.previewEnabled) return;
+    this.previewTimer = setTimeout(() => this.renderNotePreview(version).catch(error => this.status(error.message, 'error')), 180);
+  }
+  async renderNotePreview(version) {
+    const target = this.preview, child = new Component(), owner = this.child;
+    owner.addChild(child);
+    const content = target.ownerDocument.createElement('div');
+    try {
+      await MarkdownRenderer.render(this.app, this.draft().text || '*还没有写下内容。*', content, this.plugin.notePath(this.file.path), child);
+      if (version !== this.previewGeneration || !this.previewEnabled || target !== this.preview || !target.isConnected) { owner.removeChild(child); return; }
+      if (this.previewChild) owner.removeChild(this.previewChild);
+      this.previewChild = child; target.replaceChildren(content);
+    } catch (error) { owner.removeChild(child); throw error; }
   }
   clearSentence() {
     for (const mark of this.article.querySelectorAll('[data-detail]')) delete mark.dataset.detail;
@@ -521,9 +576,9 @@ class Reader extends ItemView {
     this.clearSentence();
     if (!wasOpen) {
       for (const item of this.article.querySelectorAll(`[data-sentence="${mark.dataset.sentence}"]`)) item.dataset.detail = 'true';
-      this.layers.verbs = true; this.syncLayers();
+      this.syncLayers();
       this.sentenceButton.setAttribute('aria-pressed', 'true');
-      this.status('当前句显示完整语法 · 再点一次或按 Esc 返回主干阅读。');
+      this.status('当前句临时显示全部谓语与非谓语 · 再点一次或按 Esc 恢复原显示。');
     }
   }
   selectedWord() {
@@ -588,7 +643,7 @@ class Reader extends ItemView {
     if (this.linkWriting || this.analysisTask) throw Error('正在更新阅读页，请稍后标词。');
     if (this.stale) throw Error('原文已变化，请先刷新。');
     const selected = this.selectedWord(), file = this.file, generation = this.generation, raw = this.sourceRaw;
-    this.linkWriting = true; this.status('正在标记…', 'busy');
+    this.linkWriting = true; this.linkButton.setAttribute('aria-busy', 'true');
     try {
       await this.plugin.readyFile(file);
       const start = await this.sourcePosition(selected, raw, file);
@@ -617,8 +672,7 @@ class Reader extends ItemView {
       this.article.classList.toggle('era-colors', !!this.analysisReady);
       this.linkHistory.push({ start, before: selected.quote, inserted, afterHash: hash(after), anchors, selection: selected });
       this.undoLinkButton.disabled = false; this.restoreSelection(selected.start, selected.end); this.article.scrollTop = scroll;
-      this.status(`已标为双链：${selected.quote} · 可撤销，继续阅读。`);
-    } finally { this.linkWriting = false; }
+    } finally { this.linkWriting = false; this.linkButton.removeAttribute('aria-busy'); }
   }
   async undoLink() {
     const item = this.linkHistory.at(-1);
@@ -638,7 +692,6 @@ class Reader extends ItemView {
       this.article.classList.toggle('era-colors', !!this.analysisReady);
       this.linkHistory.pop(); this.undoLinkButton.disabled = !this.linkHistory.length;
       this.restoreSelection(item.selection.start, item.selection.end); this.article.scrollTop = scroll;
-      this.status('已撤销上次标词。');
     } finally { this.linkWriting = false; }
   }
   readingGoal() { return this.plugin.data.goals?.[this.file.path] || ''; }
@@ -675,6 +728,7 @@ class Reader extends ItemView {
         original.edit = { ...original.edit, ...result.edit };
       }
       await this.plugin.flush(); await this.showSaved(); this.status(`${d.edit ? '已更新原手札' : '已保存'}：${note.path}`);
+      this.trackAgentSave(snapshot);
       for (const card of this.side.querySelectorAll('.era-question')) if (card.querySelector('p').textContent === d.question) { card.querySelector('small').textContent = '已回答'; card.classList.add('era-answered'); }
     } finally { this.saving = false; }
   }
@@ -766,15 +820,22 @@ class Reader extends ItemView {
       }, 'locate');
       this.button(actions, '设为目标', () => this.setGoal(q.text), 'flag');
       this.button(actions, '写回答', () => this.answerQuestion(q.text), 'pen-line');
+      this.button(actions, 'Agent', () => this.reviewWithAgent(q.text), 'message-circle');
     }
   }
 }
 
 class ReadingPlugin extends Plugin {
   async onload() {
+    // Obsidian evaluates main.js outside a normal CommonJS file context.
+    const localRequire = require('module').createRequire(path.join(this.app.vault.adapter.getBasePath(), this.manifest.dir, 'main.js'));
+    for (const name of ['./agent', './agent-ui', './agent-reading']) delete localRequire.cache[localRequire.resolve(name)];
+    Agent = localRequire('./agent');
+    Object.assign(Reader.prototype, localRequire('./agent-ui'));
     this.data = { drafts: {}, notes: {} }; this.pending = Promise.resolve();
     const dataPath = `${this.manifest.dir}/data.json`;
     if (await this.app.vault.adapter.exists(dataPath)) this.data = { ...this.data, ...JSON.parse(await this.app.vault.adapter.read(dataPath)) };
+    this.addSettingTab(new (Agent.settingsClass({ PluginSettingTab, Setting, Notice }))(this.app, this));
     const questionPath = `${this.manifest.dir}/focus-questions.json`;
     this.questions = await this.app.vault.adapter.exists(questionPath) ? JSON.parse(await this.app.vault.adapter.read(questionPath)) : [];
     if (!Array.isArray(this.questions)) throw Error('focus-questions.json 应为问题数组。');
@@ -782,9 +843,38 @@ class ReadingPlugin extends Plugin {
     const runtime = await this.app.vault.adapter.exists(runtimePath) ? JSON.parse(await this.app.vault.adapter.read(runtimePath)) : {};
     this.pythonPath = runtime.pythonPath || path.join(this.app.vault.adapter.getBasePath(), this.manifest.dir, '.runtime', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
     this.registerView(TYPE, leaf => new Reader(leaf, this));
+    // Core Outline has no public custom-view navigation registration. Adapt
+    // only existing Outline instances and restore their methods on unload.
+    this.outlineAdapters = new Map();
+    const adaptOutline = () => {
+      for (const leaf of this.app.workspace.getLeavesOfType('outline')) {
+        const view = leaf.view;
+        if (this.outlineAdapters.has(view) || typeof view.findCorrespondingLeaf !== 'function' || typeof view.getOwner !== 'function') continue;
+        const find = view.findCorrespondingLeaf, owner = view.getOwner;
+        const reader = () => {
+          const active = this.app.workspace.getActiveFileView();
+          const candidates = leaf.group ? this.app.workspace.getGroupLeaves(leaf.group) : active ? [active.leaf] : [];
+          return candidates.find(l => l.view instanceof Reader && l.view.file === view.file);
+        };
+        const adaptedFind = function () { return reader() || find.call(this); };
+        const adaptedOwner = function () { return reader()?.view || owner.call(this); };
+        view.findCorrespondingLeaf = adaptedFind; view.getOwner = adaptedOwner;
+        this.outlineAdapters.set(view, () => {
+          if (view.findCorrespondingLeaf === adaptedFind) view.findCorrespondingLeaf = find;
+          if (view.getOwner === adaptedOwner) view.getOwner = owner;
+        });
+        view.requestUpdate?.();
+      }
+    };
+    this.registerEvent(this.app.workspace.on('layout-change', adaptOutline));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', adaptOutline));
+    adaptOutline();
+    this.registerEvent(this.app.metadataCache.on('changed', file => {
+      for (const leaf of this.app.workspace.getLeavesOfType(TYPE)) if (leaf.view.file === file && !leaf.view.stale) leaf.view.mapOutlineHeadings();
+    }));
     this.registerHoverLinkSource(TYPE, { display: this.manifest.name || '英文阅读助手', defaultMod: true });
     this.addCommand({ id: 'open-current', name: '为当前文章打开阅读助手', callback: () => this.open().catch(e => new Notice(e.message)) });
-    for (const [id, name, method] of [['link-selection', '将阅读页选词标为双链', 'linkSelection'], ['undo-link', '撤销阅读页上次标词', 'undoLink'], ['detail-sentence', '分析阅读页当前句', 'detailSentence']]) {
+    for (const [id, name, method] of [['link-selection', '将阅读页选词标为双链', 'linkSelection'], ['undo-link', '撤销阅读页上次标词', 'undoLink'], ['detail-sentence', '分析阅读页当前句', 'detailSentence'], ['agent-sentence', '用 Agent 解释阅读页选句', 'explainWithAgent']]) {
       this.addCommand({ id, name, checkCallback: checking => {
         const view = this.app.workspace.activeLeaf?.view;
         if (!(view instanceof Reader)) return false;
@@ -804,9 +894,14 @@ class ReadingPlugin extends Plugin {
       if (this.data.parkedDrafts?.[old]) { this.data.parkedDrafts[file.path] = this.data.parkedDrafts[old]; delete this.data.parkedDrafts[old]; }
       if (this.data.notes[old]) { this.data.notes[file.path] = this.data.notes[old]; delete this.data.notes[old]; }
       if (this.data.goals?.[old]) { this.data.goals[file.path] = this.data.goals[old]; delete this.data.goals[old]; }
+      for (const key of ['agentChats', 'agentUndo']) if (this.data[key]?.[old]) { this.data[key][file.path] = this.data[key][old]; delete this.data[key][old]; }
       for (const q of this.questions) if (q.file === old) q.file = file.path;
       this.flush().catch(e => new Notice(e.message));
     }));
+  }
+  agentKey(config) {
+    const id = Agent.secretId(config.baseUrl);
+    return this.app.secretStorage?.getSecret(id) || this.sessionAgentKeys?.[id] || '';
   }
   checkFile(file) {
     if (!(file instanceof TFile) || file.extension !== 'md') throw Error('请先打开一篇 Markdown 文章。');
@@ -883,7 +978,7 @@ class ReadingPlugin extends Plugin {
       child.stdin.end(JSON.stringify({ texts }), 'utf8');
     });
   }
-  onunload() { this.app.workspace.detachLeavesOfType(TYPE); this.flush().catch(e => console.error('阅读助手草稿保存失败', e)); }
+  onunload() { for (const restore of this.outlineAdapters?.values() || []) restore(); this.outlineAdapters?.clear(); this.app.workspace.detachLeavesOfType(TYPE); this.flush().catch(e => console.error('阅读助手草稿保存失败', e)); }
 }
 module.exports = ReadingPlugin;
 module.exports.checks = { valid, locate, hash, vocabTarget, linkCandidates, applyLinkPatch, noteEntries, updatedEntry, replaceEntry };

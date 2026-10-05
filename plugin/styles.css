@@ -93,7 +93,7 @@
 .era-view .era-search .era-button { flex-shrink: 0; width: 26px; height: 26px; padding: 4px; border-radius: 4px; }
 .era-search .era-button-label { display: none; }
 .era-search[hidden], .era-view textarea[hidden], .era-note-preview[hidden] { display: none; }
-.era-note-preview { min-height: 170px; padding: 12px; margin-bottom: 12px; border: 1px solid var(--era-line); border-radius: 8px; overflow-wrap: anywhere; }
+.era-note-preview { min-height: 70px; max-height: 300px; overflow: auto; padding: 12px; margin-bottom: 12px; border: 1px solid var(--era-line); border-radius: 8px; overflow-wrap: anywhere; }
 .era-excerpt { position: relative; padding-bottom: 24px; }
 .era-excerpt + .era-excerpt { border-top: 1px solid var(--era-line); padding-top: 10px; }
 .era-excerpt blockquote { margin: 0; padding: 0; border: 0; white-space: pre-wrap; }
@@ -104,13 +104,9 @@
 .era-colors.era-groups .era-mark[data-group="1"] { background-color: var(--era-group-1); }
 .era-colors.era-groups .era-mark[data-group-start] { margin-inline-start: .10em; }
 .era-inline-heading .era-mark[data-group-start] { margin-inline-start: 0 !important; }
-.era-colors.era-verbs [data-role="main"], .era-legend [data-role="main"] { color: var(--era-main); text-decoration: underline solid; font-weight: 600; text-underline-offset: 4px; text-decoration-thickness: 1px; }
-.era-colors.era-verbs [data-role="subordinate"], .era-legend [data-role="subordinate"] { color: var(--era-subordinate); text-decoration: underline double; text-underline-offset: 4px; text-decoration-thickness: 1px; }
-.era-colors.era-verbs [data-role="nonfinite"], .era-legend [data-role="nonfinite"] { color: var(--era-nonfinite); text-decoration: underline dashed; text-underline-offset: 4px; text-decoration-thickness: 1px; }
-.era-colors.era-verbs.era-backbone [data-role="subordinate"]:not([data-detail]) { text-decoration: none; }
-.era-colors.era-verbs.era-backbone [data-role="nonfinite"]:not([data-detail]) { color: inherit; text-decoration: none; }
-.era-legend.era-backbone [data-role="nonfinite"] { display: none; }
-.era-legend.era-backbone [data-role="subordinate"] { text-decoration: none; }
+.era-colors.era-verbs [data-role="main"], .era-colors [data-detail][data-role="main"], .era-legend [data-role="main"] { color: var(--era-main); text-decoration: underline solid; font-weight: 600; text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.era-colors.era-verbs [data-role="subordinate"], .era-colors [data-detail][data-role="subordinate"], .era-legend [data-role="subordinate"] { color: var(--era-subordinate); text-decoration: underline double; text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.era-colors.era-nonfinite [data-role="nonfinite"], .era-colors [data-detail][data-role="nonfinite"], .era-legend [data-role="nonfinite"] { color: var(--era-nonfinite); text-decoration: underline dashed; text-underline-offset: 4px; text-decoration-thickness: 1px; }
 .era-mark[data-detail] { box-shadow: inset 0 -1px var(--era-boundary); }
 .era-mark a.internal-link { color: inherit; }
 .era-word-actions { display: flex; align-items: center; gap: 2px; }
@@ -150,6 +146,43 @@
 .era-answered .era-question-meta small { color: var(--text-success, var(--interactive-accent)); }
 .era-question p { font: 16px/1.6 var(--era-reading-font); margin: 0 0 12px; }
 .era-question-actions { display: flex; justify-content: space-between; gap: 4px; }
+.era-question-actions { flex-wrap: wrap; }
+.era-agent-panel label { display: block; margin: 12px 0 7px; color: var(--text-muted); font-size: 12px; }
+.era-agent-context-details { margin: 12px 0; }
+.era-agent-context-details summary { cursor: pointer; color: var(--text-muted); font-size: 12px; margin-bottom: 8px; }
+.era-agent-task { width: 100%; margin-bottom: 8px; background: var(--era-paper); color: var(--text-normal); border: 1px solid var(--era-line); }
+.era-agent-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+.era-view .era-agent-instruction { min-height: 64px; font-size: 13px; }
+.era-view .era-agent-context { min-height: 180px; max-height: 340px; font-size: 13px; line-height: 1.6; }
+.era-agent-status { margin-top: 10px; overflow-wrap: anywhere; }
+.era-agent-result-box { border-top: 1px solid var(--era-line); padding-top: 14px; margin-bottom: 16px; }
+.era-agent-result-box[hidden] { display: none; }
+.era-agent-result-label { color: var(--text-muted); font-size: 11px; margin-bottom: 10px; overflow-wrap: anywhere; }
+.era-agent-result { white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.75 var(--font-interface); user-select: text; }
+.era-agent-result h4 { margin: 10px 0 5px; font-size: 14px; line-height: 1.6; }
+.era-agent-spacer { height: 8px; }
+.era-agent-code-line { font-family: var(--font-monospace); font-size: 12px; }
+.era-agent-panel > .era-muted { overflow-wrap: anywhere; }
+.era-agent-context-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; font: 12px/1.6 var(--font-interface); background: var(--era-paper); padding: 10px; }
+.era-agent-conversation { max-height: clamp(140px, 32vh, 360px); overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin-block: 10px; }
+.era-agent-conversation:empty { display: none; }
+.era-agent-conversation:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
+.era-agent-turn { padding: 14px 0; border-bottom: 1px solid var(--era-line); font: 14px/1.7 var(--font-interface); overflow-wrap: anywhere; }
+.era-agent-user { white-space: pre-wrap; padding: 8px 10px; background: var(--background-modifier-hover); border-radius: 7px; }
+.era-agent-part { display: grid; grid-template-columns: 18px minmax(0,1fr); gap: 6px; margin: 7px 0; }
+.era-agent-part input[type=checkbox] { margin: 6px 0 0; }
+.era-agent-part-body { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; user-select: text; }
+.era-agent-part-body h4 { font-size: 14px; margin: 4px 0; }
+.era-agent-citations { grid-column: 2; display: flex; flex-wrap: wrap; gap: 4px; }
+.era-agent-citations .era-button { font-size: 11px; height: 23px; padding: 2px 5px; }
+.era-agent-turn > details { margin: 10px 0; color: var(--text-muted); font-size: 12px; }
+.era-agent-turn > details summary { cursor: pointer; }
+.era-agent-revision { border-top: 1px solid var(--era-line); margin-top: 12px; padding-top: 12px; }
+.era-agent-diff { max-height: 260px; overflow: auto; white-space: pre-wrap; font: 12px/1.7 var(--font-interface); margin: 10px 0; }
+.era-agent-diff :is(ins,del) { display: block; padding: 5px 8px; }
+.era-agent-diff ins { background: color-mix(in srgb, var(--color-green) 15%, transparent); text-decoration: none; border-left: 2px solid var(--color-green); }
+.era-agent-diff del { background: color-mix(in srgb, var(--color-red) 12%, transparent); border-left: 2px solid var(--color-red); }
+.era-settings-status { white-space: pre-wrap; color: var(--text-muted); }
 .era-question-actions .era-button { padding-inline: 4px; }
 .era-layout.era-focus { grid-template-columns: minmax(0, 1fr); }
 .era-focus .era-side { display: none; }
